@@ -18,19 +18,20 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 logging.info(f"Бот инициализирован с токеном: {TOKEN[:15]}...")
 
-# ✅ РАБОЧИЕ ОБРАБОТЧИКИ КОМАНД
+# ✅ ОБРАБОТЧИКИ КОМАНД
 
 @bot.message_handler(commands=['start', 'help'])
 def handle_start(message):
     user_id = message.from_user.id
+    chat_id = message.chat.id
     username = message.from_user.username or "Без имени"
+    
     logging.info(f"⚡ ВЫЗВАН ОБРАБОТЧИК /start от @{username} (ID: {user_id})")
     
-    # Проверяем, что бот может отвечать
     try:
-        response = f"✅ Бот на Render работает!\nID чата: {message.chat.id}\nВаш ID: {user_id}"
-        bot.send_message(message.chat.id, response)
-        logging.info(f"✅ Ответ отправлен пользователю {user_id}")
+        response = f"✅ Бот на Render работает!\nВаш ID: {user_id}\nID чата: {chat_id}"
+        bot.send_message(chat_id, response)
+        logging.info(f"✅ Ответ отправлен в chat_id={chat_id}")
     except Exception as e:
         logging.error(f"❌ Ошибка отправки: {e}")
 
@@ -38,18 +39,19 @@ def handle_start(message):
 def handle_all_messages(message):
     user_id = message.from_user.id
     text = message.text or "без текста"
+    
     logging.info(f"📨 Сообщение от {user_id}: '{text}'")
     
     try:
         if text.startswith('/'):
-            bot.send_message(message.chat.id, f"🤖 Команда '{text}' получена, но не обрабатывается")
+            bot.send_message(message.chat.id, f"🤖 Команда '{text}' получена")
         else:
             bot.send_message(message.chat.id, f"📝 Вы написали: {text}")
         logging.info(f"✅ Ответ на сообщение отправлен")
     except Exception as e:
         logging.error(f"❌ Ошибка эхо-ответа: {e}")
 
-# ✅ ИСПРАВЛЕННЫЙ ВЕБХУК С ДЕТАЛЬНОЙ ОБРАБОТКОЙ
+# ✅ ИСПРАВЛЕННЫЙ ВЕБХУК - РУЧНАЯ ОБРАБОТКА
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -61,8 +63,14 @@ def webhook():
         raw_data = request.get_data()
         logging.info(f"📦 Размер данных: {len(raw_data)} байт")
         
+        if len(raw_data) == 0:
+            logging.error("❌ Получены пустые данные")
+            return 'Empty data', 400
+            
         # Декодируем и парсим JSON
         json_str = raw_data.decode('utf-8')
+        logging.info(f"📄 JSON строка (первые 200 символов): {json_str[:200]}")
+        
         update_data = json.loads(json_str)
         
         # Логируем структуру обновления
@@ -75,20 +83,26 @@ def webhook():
             text = msg.get('text', 'без текста')
             chat_id = msg.get('chat', {}).get('id', 'unknown')
             logging.info(f"💬 Сообщение: user_id={user_id}, chat_id={chat_id}, text='{text}'")
-        elif 'callback_query' in update_data:
-            logging.info("🔘 Callback query получен")
-        else:
-            logging.warning(f"⚠️ Неизвестный тип обновления: {update_data}")
+            
+            # ✅ РУЧНАЯ ОБРАБОТКА, если библиотека не работает
+            if text == '/start' or text == '/help':
+                try:
+                    response = f"✅ Ручная обработка!\nВаш ID: {user_id}\nТекст: {text}"
+                    bot.send_message(chat_id, response)
+                    logging.info(f"✅ Ручной ответ отправлен в chat_id={chat_id}")
+                except Exception as e:
+                    logging.error(f"❌ Ошибка ручной отправки: {e}")
         
-        # Преобразуем JSON в объект Update
-        update = telebot.types.Update.de_json(json_str)
-        
-        # ✅ КРИТИЧЕСКИЙ МОМЕНТ: Передаем обновление боту
-        if update:
-            bot.process_new_updates([update])
-            logging.info("🔄 Обновление обработано ботом")
-        else:
-            logging.error("❌ Не удалось создать объект Update")
+        # Пытаемся использовать библиотеку
+        try:
+            update = telebot.types.Update.de_json(json_str)
+            if update and update.message:
+                bot.process_new_updates([update])
+                logging.info("🔄 Библиотека обработала обновление")
+            else:
+                logging.warning("⚠️ Библиотека не смогла обработать обновление")
+        except Exception as lib_error:
+            logging.error(f"❌ Ошибка библиотеки: {lib_error}")
         
     except json.JSONDecodeError as e:
         logging.error(f"❌ Ошибка декодирования JSON: {e}")
@@ -100,7 +114,7 @@ def webhook():
     logging.info("=" * 60)
     return 'OK', 200
 
-# ✅ ДОПОЛНИТЕЛЬНЫЕ МАРШРУТЫ ДЛЯ ТЕСТИРОВАНИЯ
+# ✅ ТЕСТОВЫЕ МАРШРУТЫ
 
 @app.route('/health')
 def health():
@@ -111,27 +125,19 @@ def home():
     return '''
     <h1>🤖 Бот для клуба "Увлекательные чтения"</h1>
     <p>Статус: <strong>Работает</strong> ✅</p>
-    <p>Python: 3.13.4</p>
-    <p>Вебхук: /webhook</p>
-    <p>Health check: /health</p>
-    <p>Отправьте /start боту в Telegram</p>
+    <p>Версия: <strong>Ручная обработка</strong></p>
+    <p><a href="/test_message">Тест отправки сообщения</a></p>
     '''
 
-@app.route('/test')
-def test():
-    return 'Тестовая страница работает!', 200
-
-@app.route('/debug')
-def debug():
-    token_exists = bool(TOKEN)
-    return f'''
-    <h1>🔍 Отладка бота</h1>
-    <p>Токен установлен: {token_exists}</p>
-    <p>Токен (первые 15 символов): {TOKEN[:15] if TOKEN else "Нет токена"}...</p>
-    <p>URL бота: https://telegram-bot-club.onrender.com</p>
-    <p>Вебхук: https://telegram-bot-club.onrender.com/webhook</p>
-    <p><a href="/">Главная</a> | <a href="/health">Health</a></p>
-    '''
+@app.route('/test_message')
+def test_message():
+    """Тестовая страница для проверки отправки сообщения"""
+    try:
+        # Пытаемся отправить сообщение в ваш личный чат
+        bot.send_message(1039651708, "✅ Тестовое сообщение с сайта")
+        return "Сообщение отправлено!"
+    except Exception as e:
+        return f"Ошибка отправки: {e}"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
