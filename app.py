@@ -1,62 +1,26 @@
 import os
-import telebot
-from flask import Flask, request
 import logging
+from flask import Flask, request
 import json
+import requests
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
 
-# Получаем токен из переменных окружения
+# Получаем токен
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 if not TOKEN:
-    logging.error("TELEGRAM_TOKEN не найден в переменных окружения!")
+    logging.error("❌ TELEGRAM_TOKEN не найден!")
     raise ValueError("TELEGRAM_TOKEN не найден")
 
-bot = telebot.TeleBot(TOKEN)
-logging.info(f"Бот инициализирован с токеном: {TOKEN[:15]}...")
-
-# ✅ ОБРАБОТЧИКИ КОМАНД
-
-@bot.message_handler(commands=['start', 'help'])
-def handle_start(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    username = message.from_user.username or "Без имени"
-    
-    logging.info(f"⚡ ВЫЗВАН ОБРАБОТЧИК /start от @{username} (ID: {user_id})")
-    
-    try:
-        response = f"✅ Бот на Render работает!\nВаш ID: {user_id}\nID чата: {chat_id}"
-        bot.send_message(chat_id, response)
-        logging.info(f"✅ Ответ отправлен в chat_id={chat_id}")
-    except Exception as e:
-        logging.error(f"❌ Ошибка отправки: {e}")
-
-@bot.message_handler(func=lambda message: True)
-def handle_all_messages(message):
-    user_id = message.from_user.id
-    text = message.text or "без текста"
-    
-    logging.info(f"📨 Сообщение от {user_id}: '{text}'")
-    
-    try:
-        if text.startswith('/'):
-            bot.send_message(message.chat.id, f"🤖 Команда '{text}' получена")
-        else:
-            bot.send_message(message.chat.id, f"📝 Вы написали: {text}")
-        logging.info(f"✅ Ответ на сообщение отправлен")
-    except Exception as e:
-        logging.error(f"❌ Ошибка эхо-ответа: {e}")
-
-# ✅ ИСПРАВЛЕННЫЙ ВЕБХУК - РУЧНАЯ ОБРАБОТКА
+logging.info(f"✅ Токен получен: {TOKEN[:15]}...")
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     logging.info("=" * 60)
-    logging.info("🌐 ПОЛУЧЕН ВЕБХУК ОТ TELEGRAM")
+    logging.info("🌐 НОВЫЙ ВЕБХУК ПОЛУЧЕН")
     
     try:
         # Получаем сырые данные
@@ -64,57 +28,58 @@ def webhook():
         logging.info(f"📦 Размер данных: {len(raw_data)} байт")
         
         if len(raw_data) == 0:
-            logging.error("❌ Получены пустые данные")
-            return 'Empty data', 400
-            
-        # Декодируем и парсим JSON
+            logging.error("❌ Пустые данные!")
+            return 'Empty', 400
+        
+        # Показываем первые 300 символов
         json_str = raw_data.decode('utf-8')
-        logging.info(f"📄 JSON строка (первые 200 символов): {json_str[:200]}")
+        logging.info(f"📄 Данные (первые 300 символов): {json_str[:300]}")
         
-        update_data = json.loads(json_str)
+        # Парсим JSON
+        data = json.loads(json_str)
+        logging.info(f"📊 Ключи в JSON: {list(data.keys())}")
         
-        # Логируем структуру обновления
-        logging.info(f"📊 Ключи в обновлении: {list(update_data.keys())}")
-        
-        # Проверяем тип обновления
-        if 'message' in update_data:
-            msg = update_data['message']
-            user_id = msg.get('from', {}).get('id', 'unknown')
-            text = msg.get('text', 'без текста')
-            chat_id = msg.get('chat', {}).get('id', 'unknown')
-            logging.info(f"💬 Сообщение: user_id={user_id}, chat_id={chat_id}, text='{text}'")
+        # Проверяем, есть ли сообщение
+        if 'message' in data:
+            msg = data['message']
+            chat_id = msg['chat']['id']
+            user_id = msg['from']['id']
+            text = msg.get('text', '')
             
-            # ✅ РУЧНАЯ ОБРАБОТКА, если библиотека не работает
-            if text == '/start' or text == '/help':
-                try:
-                    response = f"✅ Ручная обработка!\nВаш ID: {user_id}\nТекст: {text}"
-                    bot.send_message(chat_id, response)
-                    logging.info(f"✅ Ручной ответ отправлен в chat_id={chat_id}")
-                except Exception as e:
-                    logging.error(f"❌ Ошибка ручной отправки: {e}")
-        
-        # Пытаемся использовать библиотеку
-        try:
-            update = telebot.types.Update.de_json(json_str)
-            if update and update.message:
-                bot.process_new_updates([update])
-                logging.info("🔄 Библиотека обработала обновление")
+            logging.info(f"💬 Сообщение: chat_id={chat_id}, user_id={user_id}, text='{text}'")
+            
+            # Отправляем ответ через Telegram API
+            if text == '/start' or text == '/start@UvlekatelnyeChteniyaClubBot':
+                response_text = f"✅ Бот работает!\nВаш ID: {user_id}\nChat ID: {chat_id}"
             else:
-                logging.warning("⚠️ Библиотека не смогла обработать обновление")
-        except Exception as lib_error:
-            logging.error(f"❌ Ошибка библиотеки: {lib_error}")
+                response_text = f"📝 Вы написали: {text}"
+            
+            # Отправка через прямой API запрос
+            api_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            payload = {
+                'chat_id': chat_id,
+                'text': response_text
+            }
+            
+            try:
+                resp = requests.post(api_url, json=payload, timeout=10)
+                logging.info(f"📤 Ответ отправлен. Статус: {resp.status_code}")
+                if resp.status_code != 200:
+                    logging.error(f"❌ Ошибка API: {resp.text}")
+            except Exception as e:
+                logging.error(f"❌ Ошибка отправки: {e}")
+        else:
+            logging.warning(f"⚠️ Нет поля 'message'. Весь JSON: {json.dumps(data, indent=2)}")
         
     except json.JSONDecodeError as e:
-        logging.error(f"❌ Ошибка декодирования JSON: {e}")
-        return 'Invalid JSON', 400
+        logging.error(f"❌ Ошибка JSON: {e}")
+        return 'Bad JSON', 400
     except Exception as e:
-        logging.error(f"❌ Критическая ошибка в вебхуке: {e}", exc_info=True)
-        return 'Server Error', 500
+        logging.error(f"❌ Общая ошибка: {e}", exc_info=True)
+        return 'Error', 500
     
     logging.info("=" * 60)
     return 'OK', 200
-
-# ✅ ТЕСТОВЫЕ МАРШРУТЫ
 
 @app.route('/health')
 def health():
@@ -124,20 +89,24 @@ def health():
 def home():
     return '''
     <h1>🤖 Бот для клуба "Увлекательные чтения"</h1>
-    <p>Статус: <strong>Работает</strong> ✅</p>
-    <p>Версия: <strong>Ручная обработка</strong></p>
-    <p><a href="/test_message">Тест отправки сообщения</a></p>
+    <p><strong>Статус: Работает (прямой API)</strong></p>
+    <p>Отправьте /start боту в Telegram</p>
+    <p>Логи показывают детали каждого вебхука</p>
     '''
 
-@app.route('/test_message')
-def test_message():
-    """Тестовая страница для проверки отправки сообщения"""
+@app.route('/test')
+def test():
+    """Тестовая отправка сообщения"""
     try:
-        # Пытаемся отправить сообщение в ваш личный чат
-        bot.send_message(1039651708, "✅ Тестовое сообщение с сайта")
-        return "Сообщение отправлено!"
+        test_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        test_data = {
+            'chat_id': 1039651708,  # Ваш ID
+            'text': '✅ Тест с сайта render.com'
+        }
+        resp = requests.post(test_url, json=test_data)
+        return f"Тест отправлен: {resp.status_code}"
     except Exception as e:
-        return f"Ошибка отправки: {e}"
+        return f"Ошибка теста: {e}"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
