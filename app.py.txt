@@ -1,0 +1,160 @@
+import os
+import telebot
+from flask import Flask, request
+import json
+
+# Создаем Flask приложение
+app = Flask(__name__)
+
+# Получаем токен бота из переменных окружения
+TOKEN = os.environ.get('TELEGRAM_TOKEN', '8520799597:AAEHcpOpjRWBgQCtR79Qgi2FMY_hXNJOX9w')
+
+# Создаем бота
+bot = telebot.TeleBot(TOKEN)
+
+# Хранилище данных в памяти (пока простое)
+users = {}
+posts = []
+
+# Команда /start
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    user_id = message.from_user.id
+    user_name = message.from_user.first_name
+    
+    # Сохраняем пользователя
+    users[user_id] = {
+        'name': user_name,
+        'balance': 10,  # Начальные кавычки
+        'posts': 0
+    }
+    
+    bot.reply_to(message, 
+        f"?? Привет, {user_name}!\n"
+        f"?? Добро пожаловать в 'Увлекательные чтения'!\n"
+        f"?? Ваш баланс: 10 кавычек\n\n"
+        f"?? Правила: /rules\n"
+        f"?? Очередь: /queue\n"
+        f"?? Баланс: /balance"
+    )
+
+# Команда /rules
+@bot.message_handler(commands=['rules'])
+def rules_command(message):
+    bot.reply_to(message,
+        "?? ПРАВИЛА КЛУБА:\n\n"
+        "? Читаем друг друга\n"
+        "? Даем честный фидбек\n"
+        "? 1 статья раз в 2 дня\n"
+        "? Не спамим ссылками\n"
+        "? Не токсичничаем\n\n"
+        "?? Цель: расти вместе как авторы!"
+    )
+
+# Команда /queue
+@bot.message_handler(commands=['queue'])
+def queue_command(message):
+    if len(posts) == 0:
+        bot.reply_to(message, "?? Очередь пуста. Будьте первым!")
+    else:
+        text = "?? ОЧЕРЕДЬ ПУБЛИКАЦИЙ:\n\n"
+        for i, post in enumerate(posts[:5], 1):
+            user_name = users.get(post['user_id'], {}).get('name', 'Аноним')
+            text += f"{i}. {user_name}\n"
+            text += f"   ?? {post['link'][:30]}...\n\n"
+        bot.reply_to(message, text)
+
+# Команда /balance
+@bot.message_handler(commands=['balance'])
+def balance_command(message):
+    user_id = message.from_user.id
+    if user_id in users:
+        balance = users[user_id]['balance']
+        bot.reply_to(message, f"?? Ваш баланс: {balance} кавычек")
+    else:
+        bot.reply_to(message, "? Сначала напишите /start")
+
+# Команда /submit - подача статьи
+@bot.message_handler(commands=['submit'])
+def submit_command(message):
+    if message.chat.type != 'private':
+        bot.reply_to(message, "?? Пишите /submit в личные сообщения боту!")
+        return
+    
+    # Запрашиваем ссылку
+    msg = bot.reply_to(message, 
+        "?? ПОДАЧА СТАТЬИ:\n\n"
+        "Отправьте ссылку на вашу статью.\n"
+        "Пример: https://habr.com/ru/post/123456/"
+    )
+    
+    # Регистрируем следующий шаг
+    bot.register_next_step_handler(msg, process_link)
+
+def process_link(message):
+    user_id = message.from_user.id
+    link = message.text
+    
+    # Проверяем, что это ссылка
+    if not link.startswith('http'):
+        bot.reply_to(message, "? Это не похоже на ссылку. Попробуйте снова: /submit")
+        return
+    
+    # Добавляем в очередь
+    post = {
+        'user_id': user_id,
+        'link': link,
+        'status': 'waiting'
+    }
+    posts.append(post)
+    
+    # Обновляем статистику пользователя
+    if user_id in users:
+        users[user_id]['posts'] += 1
+        users[user_id]['balance'] += 10  # Награда за подачу
+    
+    bot.reply_to(message,
+        f"? Статья добавлена в очередь!\n"
+        f"?? Позиция в очереди: {len(posts)}\n"
+        f"?? +10 кавычек за подачу!\n\n"
+        f"Очередь: /queue"
+    )
+
+# Вебхук для получения сообщений от Telegram
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return 'OK'
+    return 'Bad request'
+
+# Страница для проверки работы
+@app.route('/')
+def home():
+    return '''
+    <h1>?? Бот "Увлекательные чтения" работает!</h1>
+    <p>? Статус: ONLINE</p>
+    <p>?? Пользователей: {}</p>
+    <p>?? Статей в очереди: {}</p>
+    <p><a href="/webhook">Вебхук</a> | <a href="/health">Проверка</a></p>
+    '''.format(len(users), len(posts))
+
+# Страница для проверки здоровья
+@app.route('/health')
+def health():
+    return 'OK'
+
+# Установка вебхука
+@app.route('/set_webhook')
+def set_webhook():
+    # Узнаем наш адрес на Render
+    webhook_url = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:5000') + '/webhook'
+    bot.remove_webhook()
+    bot.set_webhook(url=webhook_url)
+    return f'Вебхук установлен на: {webhook_url}'
+
+# Запуск приложения
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
