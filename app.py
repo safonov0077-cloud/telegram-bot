@@ -1,112 +1,93 @@
 import os
 import logging
-from flask import Flask, request
-import json
+from flask import Flask, request, jsonify
 import requests
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
 
-# Получаем токен
+# Получение токена
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 if not TOKEN:
-    logging.error("❌ TELEGRAM_TOKEN не найден!")
-    raise ValueError("TELEGRAM_TOKEN не найден")
+    logging.error("TELEGRAM_TOKEN не найден!")
+    raise ValueError("TELEGRAM_TOKEN не найден!")
 
-logging.info(f"✅ Токен получен: {TOKEN[:15]}...")
+TELEGRAM_API_URL = f'https://api.telegram.org/bot{TOKEN}'
+
+@app.route('/')
+def index():
+    return "Telegram Bot is running!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    logging.info("=" * 60)
-    logging.info("🌐 НОВЫЙ ВЕБХУК ПОЛУЧЕН")
-    
+    """Обработка входящих сообщений от Telegram"""
     try:
-        # Получаем сырые данные
-        raw_data = request.get_data()
-        logging.info(f"📦 Размер данных: {len(raw_data)} байт")
+        data = request.get_json()
+        logging.info(f"Получен webhook: {data}")
         
-        if len(raw_data) == 0:
-            logging.error("❌ Пустые данные!")
-            return 'Empty', 400
-        
-        # Показываем первые 300 символов
-        json_str = raw_data.decode('utf-8')
-        logging.info(f"📄 Данные (первые 300 символов): {json_str[:300]}")
-        
-        # Парсим JSON
-        data = json.loads(json_str)
-        logging.info(f"📊 Ключи в JSON: {list(data.keys())}")
-        
-        # Проверяем, есть ли сообщение
         if 'message' in data:
-            msg = data['message']
-            chat_id = msg['chat']['id']
-            user_id = msg['from']['id']
-            text = msg.get('text', '')
+            chat_id = data['message']['chat']['id']
+            text = data['message'].get('text', '')
             
-            logging.info(f"💬 Сообщение: chat_id={chat_id}, user_id={user_id}, text='{text}'")
-            
-            # Отправляем ответ через Telegram API
-            if text == '/start' or text == '/start@UvlekatelnyeChteniyaClubBot':
-                response_text = f"✅ Бот работает!\nВаш ID: {user_id}\nChat ID: {chat_id}"
-            else:
-                response_text = f"📝 Вы написали: {text}"
-            
-            # Отправка через прямой API запрос
-            api_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-            payload = {
-                'chat_id': chat_id,
-                'text': response_text
-            }
-            
-            try:
-                resp = requests.post(api_url, json=payload, timeout=10)
-                logging.info(f"📤 Ответ отправлен. Статус: {resp.status_code}")
-                if resp.status_code != 200:
-                    logging.error(f"❌ Ошибка API: {resp.text}")
-            except Exception as e:
-                logging.error(f"❌ Ошибка отправки: {e}")
-        else:
-            logging.warning(f"⚠️ Нет поля 'message'. Весь JSON: {json.dumps(data, indent=2)}")
+            if text:
+                # Ответ на сообщение
+                response_text = f"Вы написали: {text}"
+                send_message(chat_id, response_text)
+                logging.info(f"Отправлен ответ: {response_text}")
         
-    except json.JSONDecodeError as e:
-        logging.error(f"❌ Ошибка JSON: {e}")
-        return 'Bad JSON', 400
-    except Exception as e:
-        logging.error(f"❌ Общая ошибка: {e}", exc_info=True)
-        return 'Error', 500
+        return jsonify({'ok': True})
     
-    logging.info("=" * 60)
-    return 'OK', 200
-
-@app.route('/health')
-def health():
-    return 'OK', 200
-
-@app.route('/')
-def home():
-    return '''
-    <h1>🤖 Бот для клуба "Увлекательные чтения"</h1>
-    <p><strong>Статус: Работает (прямой API)</strong></p>
-    <p>Отправьте /start боту в Telegram</p>
-    <p>Логи показывают детали каждого вебхука</p>
-    '''
-
-@app.route('/test')
-def test():
-    """Тестовая отправка сообщения"""
-    try:
-        test_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        test_data = {
-            'chat_id': 1039651708,  # Ваш ID
-            'text': '✅ Тест с сайта render.com'
-        }
-        resp = requests.post(test_url, json=test_data)
-        return f"Тест отправлен: {resp.status_code}"
     except Exception as e:
-        return f"Ошибка теста: {e}"
+        logging.error(f"Ошибка в webhook: {e}")
+        return jsonify({'ok': False, 'error': str(e)})
+
+def send_message(chat_id, text):
+    """Отправка сообщения в Telegram"""
+    url = f'{TELEGRAM_API_URL}/sendMessage'
+    data = {
+        'chat_id': chat_id,
+        'text': text
+    }
+    response = requests.post(url, json=data)
+    return response.json()
+
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    """Установка webhook для Telegram"""
+    try:
+        # Получаем URL из переменных окружения (для Render)
+        webhook_url = os.environ.get('WEBHOOK_URL', 
+                                     request.host_url.replace('http://', 'https://') + 'webhook')
+        
+        # Если не https, попробуем сделать через ngrok для локальной разработки
+        if not webhook_url.startswith('https'):
+            webhook_url = webhook_url.replace('http://', 'https://')
+            logging.warning(f"Используем https вместо http: {webhook_url}")
+        
+        url = f'{TELEGRAM_API_URL}/setWebhook?url={webhook_url}'
+        response = requests.get(url)
+        result = response.json()
+        
+        logging.info(f"Webhook установлен: {result}")
+        return jsonify(result)
+    
+    except Exception as e:
+        logging.error(f"Ошибка установки webhook: {e}")
+        return jsonify({'error': str(e)})
+
+@app.route('/remove_webhook', methods=['GET'])
+def remove_webhook():
+    """Удаление webhook"""
+    try:
+        url = f'{TELEGRAM_API_URL}/deleteWebhook'
+        response = requests.get(url)
+        return jsonify(response.json())
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    # Для локальной разработки
+    app.run(host='0.0.0.0', port=5000, debug=True)
