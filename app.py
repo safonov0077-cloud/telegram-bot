@@ -1,93 +1,69 @@
 import os
 import logging
 from flask import Flask, request, jsonify
+import json
 import requests
+from datetime import datetime
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
 
-# Получение токена
+# Токен из переменных окружения
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 if not TOKEN:
-    logging.error("TELEGRAM_TOKEN не найден!")
-    raise ValueError("TELEGRAM_TOKEN не найден!")
+    logging.error("❌ TELEGRAM_TOKEN не найден!")
+    raise ValueError("Установите TELEGRAM_TOKEN в переменных окружения")
 
-TELEGRAM_API_URL = f'https://api.telegram.org/bot{TOKEN}'
+logging.info(f"✅ Токен загружен: {TOKEN[:10]}...")
 
 @app.route('/')
 def index():
-    return "Telegram Bot is running!"
+    return '''
+    <h1>🤖 Бот для клуба "Увлекательные чтения"</h1>
+    <p><strong>Статус: Работает</strong></p>
+    <p>Вебхук: /webhook</p>
+    <p>Проверка здоровья: <a href="/health">/health</a></p>
+    '''
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Обработка входящих сообщений от Telegram"""
     try:
         data = request.get_json()
-        logging.info(f"Получен webhook: {data}")
+        logging.info(f"Получен вебхук: {data}")
         
         if 'message' in data:
             chat_id = data['message']['chat']['id']
             text = data['message'].get('text', '')
             
-            if text:
-                # Ответ на сообщение
-                response_text = f"Вы написали: {text}"
-                send_message(chat_id, response_text)
-                logging.info(f"Отправлен ответ: {response_text}")
-        
-        return jsonify({'ok': True})
-    
+            # Отправляем ответ
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            payload = {
+                'chat_id': chat_id,
+                'text': f'Вы написали: {text}' if text else 'Получено сообщение!'
+            }
+            requests.post(url, json=payload)
+            
+        return jsonify({'status': 'ok'}), 200
     except Exception as e:
-        logging.error(f"Ошибка в webhook: {e}")
-        return jsonify({'ok': False, 'error': str(e)})
+        logging.error(f"Ошибка: {e}")
+        return jsonify({'error': str(e)}), 500
 
-def send_message(chat_id, text):
-    """Отправка сообщения в Telegram"""
-    url = f'{TELEGRAM_API_URL}/sendMessage'
-    data = {
-        'chat_id': chat_id,
-        'text': text
-    }
-    response = requests.post(url, json=data)
-    return response.json()
+@app.route('/health')
+def health():
+    """Проверка здоровья - ОБЯЗАТЕЛЬНЫЙ эндпоинт для Render"""
+    return jsonify({
+        'status': 'healthy',
+        'service': 'telegram-bot-club',
+        'timestamp': datetime.now().isoformat()
+    }), 200
 
-@app.route('/set_webhook', methods=['GET'])
-def set_webhook():
-    """Установка webhook для Telegram"""
-    try:
-        # Получаем URL из переменных окружения (для Render)
-        webhook_url = os.environ.get('WEBHOOK_URL', 
-                                     request.host_url.replace('http://', 'https://') + 'webhook')
-        
-        # Если не https, попробуем сделать через ngrok для локальной разработки
-        if not webhook_url.startswith('https'):
-            webhook_url = webhook_url.replace('http://', 'https://')
-            logging.warning(f"Используем https вместо http: {webhook_url}")
-        
-        url = f'{TELEGRAM_API_URL}/setWebhook?url={webhook_url}'
-        response = requests.get(url)
-        result = response.json()
-        
-        logging.info(f"Webhook установлен: {result}")
-        return jsonify(result)
-    
-    except Exception as e:
-        logging.error(f"Ошибка установки webhook: {e}")
-        return jsonify({'error': str(e)})
-
-@app.route('/remove_webhook', methods=['GET'])
-def remove_webhook():
-    """Удаление webhook"""
-    try:
-        url = f'{TELEGRAM_API_URL}/deleteWebhook'
-        response = requests.get(url)
-        return jsonify(response.json())
-    except Exception as e:
-        return jsonify({'error': str(e)})
+@app.route('/test')
+def test():
+    """Тестовый эндпоинт"""
+    return 'Тест пройден!', 200
 
 if __name__ == '__main__':
-    # Для локальной разработки
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
