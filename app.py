@@ -55,6 +55,8 @@ user_last_submit = {}  # user_id -> время последней подачи
 user_daily_reward = {}  # user_id -> дата последней награды
 games_history = []  # История игр
 duels = []  # Активные дуэли
+games_results = []  # Результаты игр для закрепа
+games_pin_message_id = None  # ID закрепленного сообщения в теме игр
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 
@@ -81,6 +83,34 @@ def send_telegram_message(chat_id, text, reply_to_message_id=None, topic_id=None
     except Exception as e:
         logger.error(f"Ошибка отправки сообщения: {e}")
         return None
+
+def delete_telegram_message(chat_id, message_id):
+    """Удаление сообщения в Telegram"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
+    payload = {'chat_id': chat_id, 'message_id': message_id}
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.error(f"Ошибка удаления сообщения: {e}")
+        return None
+
+def schedule_message_deletion(chat_id, message_id, delay_seconds):
+    """Планирование удаления сообщения"""
+    threading.Timer(delay_seconds, delete_telegram_message, args=[chat_id, message_id]).start()
+
+def send_temporary_message(chat_id, text, delete_after_seconds, reply_to_message_id=None, topic_id=None):
+    """Отправка временного сообщения, удаляемого через заданное время"""
+    result = send_telegram_message(
+        chat_id,
+        text,
+        reply_to_message_id=reply_to_message_id,
+        topic_id=topic_id
+    )
+    if result and 'result' in result:
+        schedule_message_deletion(chat_id, result['result']['message_id'], delete_after_seconds)
+    return result
 
 def is_user_registered(user_id):
     """Проверка регистрации пользователя"""
@@ -330,6 +360,43 @@ def get_user_top(limit=10):
     user_list.sort(key=lambda x: x['quotes'], reverse=True)
     return user_list[:limit]
 
+def update_games_pin():
+    """Обновление закрепа с результатами игр в теме игр"""
+    global games_pin_message_id
+    if not games_results:
+        pin_text = "🏆 <b>РЕЗУЛЬТАТЫ ИГР</b>\n\nПока нет завершенных игр."
+    else:
+        lines = ["🏆 <b>РЕЗУЛЬТАТЫ ИГР</b>", ""]
+        for result in games_results[-10:]:
+            winners_text = ", ".join(result['winners']) if result['winners'] else "Нет победителей"
+            lines.append(
+                f"• <b>{result['title']}</b> — {result['date']}\n"
+                f"  Победители: {winners_text}"
+            )
+        pin_text = "\n".join(lines)
+
+    if games_pin_message_id:
+        edit_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+        payload = {
+            'chat_id': GROUP_ID,
+            'message_id': games_pin_message_id,
+            'text': pin_text,
+            'parse_mode': 'HTML'
+        }
+        requests.post(edit_url, json=payload, timeout=10)
+        return
+
+    result = send_telegram_message(GROUP_ID, pin_text, topic_id=GROUP_TOPICS['games'])
+    if result and 'result' in result:
+        games_pin_message_id = result['result']['message_id']
+        pin_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/pinChatMessage"
+        pin_payload = {
+            'chat_id': GROUP_ID,
+            'message_id': games_pin_message_id,
+            'disable_notification': True
+        }
+        requests.post(pin_url, json=pin_payload, timeout=10)
+
 # ============ ИГРЫ И АКТИВНОСТИ ============
 
 def start_paragraph_duel(initiator_id, topic=None):
@@ -576,6 +643,11 @@ def finish_truth_game(game_id):
         if answer.lower() == correct_answer.lower():
             winners.append(user_id)
             add_quotes(user_id, game['prize'], "Победа в игре")
+
+    winners_names = [
+        f"@{users[winner_id].get('username', 'пользователь')}" if users.get(winner_id) else "пользователь"
+        for winner_id in winners
+    ]
     
     # Формируем результат
     result_text = f"""
@@ -610,6 +682,13 @@ def finish_truth_game(game_id):
     send_telegram_message(GROUP_ID, result_text, 
                          reply_to_message_id=game.get('message_id'),
                          topic_id=GROUP_TOPICS['games'])
+
+    games_results.append({
+        'title': "Правда или выдумка",
+        'date': datetime.now().strftime('%d.%m.%Y'),
+        'winners': winners_names
+    })
+    update_games_pin()
 
 def wheel_of_themes_game():
     """Колесо тем для мини-текстов"""
@@ -716,6 +795,14 @@ def finish_wheel_game(game_id):
     send_telegram_message(GROUP_ID, result_text, 
                          reply_to_message_id=game.get('message_id'),
                          topic_id=GROUP_TOPICS['games'])
+
+    winners_names = [username] if game['participants'] else []
+    games_results.append({
+        'title': "Колесо тем",
+        'date': datetime.now().strftime('%d.%m.%Y'),
+        'winners': winners_names
+    })
+    update_games_pin()
 
 # ============ ОБРАБОТЧИКИ КОМАНД ============
 
@@ -850,7 +937,11 @@ def process_reply(message):
     chat_id = message['chat']['id']
     user_id = message['from']['id']
     text = message.get('text', '')
+    message_thread_id = message.get('message_thread_id')
     reply_to = message['reply_to_message']
+
+    if message_thread_id == GROUP_TOPICS['games']:
+        schedule_message_deletion(chat_id, message['message_id'], 24 * 60 * 60)
     
     # Проверяем, является ли ответ дуэли
     for duel in duels:
@@ -862,7 +953,11 @@ def process_reply(message):
             duel['paragraphs'][user_id] = text
             
             # Подтверждение участия
-            send_telegram_message(user_id, "✅ Ваш абзац принят! Ждите результатов голосования.")
+            send_temporary_message(
+                user_id,
+                "✅ Ваш абзац принят! Ждите результатов голосования.",
+                60
+            )
             return
     
     # Проверяем, является ли ответ игрой "Правда или выдумка"
@@ -874,7 +969,11 @@ def process_reply(message):
             answer = text.lower().strip()
             if answer in ['правда', 'выдумка']:
                 game['participants'][user_id] = answer
-                send_telegram_message(user_id, "✅ Ваш ответ принят! Ждите результатов.")
+                send_temporary_message(
+                    user_id,
+                    "✅ Ваш ответ принят! Ждите результатов.",
+                    60
+                )
             return
     
     # Проверяем, является ли ответ игрой "Колесо тем"
@@ -894,10 +993,18 @@ def process_reply(message):
                             'theme': theme_num,
                             'text': game_text
                         }
-                        send_telegram_message(user_id, "✅ Ваш текст принят! Ждите результатов.")
+                        send_temporary_message(
+                            user_id,
+                            "✅ Ваш текст принят! Ждите результатов.",
+                            60
+                        )
                         return
             
-            send_telegram_message(user_id, "Укажите номер темы в начале сообщения (1, 2 или 3)")
+            send_temporary_message(
+                user_id,
+                "Укажите номер темы в начале сообщения (1, 2 или 3)",
+                60
+            )
             return
 
 def process_callback(callback):
