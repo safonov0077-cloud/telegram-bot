@@ -5,6 +5,7 @@ import threading
 import time
 import re
 import atexit
+import random
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from urllib.parse import urlparse
@@ -25,69 +26,34 @@ logger = logging.getLogger("clubbot")
 
 app = Flask(__name__)
 
+# ТОКЕН ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 if not TELEGRAM_TOKEN:
-    logger.warning("TELEGRAM_TOKEN пустой. Бот не сможет отвечать, пока не задашь переменную окружения.")
+    logger.error("❌ TELEGRAM_TOKEN пустой! Задайте переменную окружения TELEGRAM_TOKEN")
+    TELEGRAM_TOKEN = ""
 
-# Лучше использовать числовой ID супергруппы вида -100xxxxxxxxxx.
-# Если оставишь @username, обычно тоже работает, но с темами иногда бывают сюрпризы.
-GROUP_ID = os.environ.get("GROUP_ID", "@uvlekatelnyechteniya").strip()
+# ID ГРУППЫ (получен через @getidsbot)
+GROUP_ID = "-1003646270051"  # Ваша группа @uvlekatelnyechteniya
 
-# Админы (ID пользователей)
-ADMIN_IDS = set(map(int, os.environ.get("ADMIN_IDS", "1039651708").split(",")))
+# ID администратора
+ADMIN_IDS = {1039651708}
 
-# Темы (message_thread_id)
-GROUP_TOPICS = {
-    "announcements": 1,   # Объявления
-    "rules": 2,           # Правила и FAQ
-    "queue": 3,           # Очередь публикаций
-    "reading_list": 4,    # Лист чтения дня
-    "feedback": 5,        # Фидбек
-    "duels": 6,           # Дуэли
-    "games": 7,           # Игры дня
-    "shop": 8,            # Магазин
-    "offtop": 9,          # Оффтоп
-}
-
-DATA_FILE = os.environ.get("BOT_DATA_FILE", "data.json")
-DATA_LOCK = threading.Lock()
-
-# =========================
-# ДАННЫЕ (память -> JSON)
-# =========================
-
-users = {}  # user_id -> profile dict
+# Временное хранение данных в памяти
+users = {}
 articles_queue = deque(maxlen=10)
-published_articles = []  # list of articles (today)
-user_articles = defaultdict(list)  # user_id -> list of articles
-user_balances = defaultdict(int)  # user_id -> quotes
-user_last_submit = {}  # user_id -> datetime
-user_daily_reward = {}  # user_id -> ISO date string
-user_submit_notified = {}  # user_id -> ISO datetime string last notification
+published_articles = []
+user_articles = defaultdict(list)
+user_balances = defaultdict(int)
+user_last_submit = {}
+user_daily_reward = {}
+user_submit_notified = {}
+user_states = {}
 
-games_history = []  # truth/wheel etc
-games_results = []  # for pinned results
-games_pin_message_id = None
+# Игры
+games_history = []
+duels = []
 
-duels = []  # paragraph duels
-
-# Новое: кости со ставками
-dice_games = {}  # game_id -> dict
-
-# Новое: закрепленные меню в темах
-topic_menu_message_ids = {}  # topic_key -> message_id
-
-# Новое: “чистый UI” для каждого пользователя (чтоб не мусорить)
-# ключ: (user_id, chat_id, thread_id) -> last_message_id
-user_last_ui_message = {}
-
-# Новое: стейт для подачи статьи в личке
-user_states = {}  # user_id -> dict(state=..., started_at=...)
-
-# =========================
-# ТЕКСТЫ (легче, позитивнее, 3 платформы)
-# =========================
-
+# Тексты
 ALLOWED_PLATFORMS_TEXT = "VK, Дзен, Telegram"
 ALLOWED_DOMAINS = {
     "vk.com", "m.vk.com",
@@ -95,90 +61,57 @@ ALLOWED_DOMAINS = {
     "t.me", "telegra.ph",
 }
 
-WELCOME_PRIVATE = (
-    "📚 <b>Увлекательные чтения</b>\n\n"
-    "Тут не цирк взаимных лайков, а нормальный клуб: читаем, обсуждаем, растем.\n"
-    "Есть очередь, лист чтения в 19:00 МСК и игры, чтобы мозг не превращался в пюре.\n\n"
-    "Ссылки на статьи принимаем только: <b>{}</b>.\n"
-    "Это не потому что мы вредные. Хотя и это тоже.\n\n"
-    "Команды:\n"
-    "/help - помощь\n"
-    "/submit - подать статью (в личке)\n"
-    "/profile - профиль\n"
-    "/balance - баланс\n"
-).format(ALLOWED_PLATFORMS_TEXT)
-
 # =========================
-# TELEGRAM API HELPERS
+# TELEGRAM API
 # =========================
 
 def tg(method: str, payload: dict, timeout: int = 12):
+    """Базовый вызов Telegram API"""
+    if not TELEGRAM_TOKEN:
+        logger.error("Токен не установлен!")
+        return None
+        
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
     try:
-        r = requests.post(url, json=payload, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
+        response = requests.post(url, json=payload, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
         if not data.get("ok"):
-            logger.error("Telegram API error %s: %s", method, data)
+            logger.error(f"Telegram API error {method}: {data}")
         return data
     except Exception as e:
-        logger.error("Telegram request failed %s: %s", method, e)
+        logger.error(f"Telegram request failed {method}: {e}")
         return None
 
-def send_telegram_message(chat_id, text, topic_id=None, reply_to_message_id=None, parse_mode="HTML", reply_markup=None, disable_web_page_preview=True):
+def send_telegram_message(chat_id, text, parse_mode="HTML", reply_markup=None):
+    """Отправка сообщения в Telegram"""
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": parse_mode,
-        "disable_web_page_preview": disable_web_page_preview,
+        "disable_web_page_preview": True,
     }
-    if topic_id:
-        payload["message_thread_id"] = topic_id
-    if reply_to_message_id:
-        payload["reply_to_message_id"] = reply_to_message_id
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    
+    logger.info(f"📤 Отправка сообщения в {chat_id}: {text[:100]}...")
     return tg("sendMessage", payload)
 
-def edit_message_text(chat_id, message_id, text, reply_markup=None, parse_mode="HTML", disable_web_page_preview=True):
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": disable_web_page_preview,
-    }
-    if reply_markup is not None:
-        payload["reply_markup"] = reply_markup
-    return tg("editMessageText", payload)
-
-def edit_message_reply_markup(chat_id, message_id, reply_markup=None):
-    payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup}
-    return tg("editMessageReplyMarkup", payload)
-
-def delete_telegram_message(chat_id, message_id):
-    payload = {"chat_id": chat_id, "message_id": message_id}
-    return tg("deleteMessage", payload)
-
-def pin_message(chat_id, message_id, disable_notification=True):
-    payload = {"chat_id": chat_id, "message_id": message_id, "disable_notification": disable_notification}
-    return tg("pinChatMessage", payload)
-
 def answer_callback(callback_query_id, text, show_alert=False):
-    payload = {"callback_query_id": callback_query_id, "text": text, "show_alert": show_alert}
+    """Ответ на callback query"""
+    payload = {
+        "callback_query_id": callback_query_id,
+        "text": text,
+        "show_alert": show_alert
+    }
     return tg("answerCallbackQuery", payload)
 
-def send_dice(chat_id, topic_id=None, emoji="🎲"):
-    payload = {"chat_id": chat_id, "emoji": emoji, "disable_notification": True}
-    if topic_id:
-        payload["message_thread_id"] = topic_id
-    return tg("sendDice", payload, timeout=15)
-
 # =========================
-# UTILS
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =========================
 
 def html_escape(s: str) -> str:
+    """Экранирование HTML"""
     if s is None:
         return ""
     return (
@@ -190,333 +123,70 @@ def html_escape(s: str) -> str:
     )
 
 def normalize_command(text: str) -> str:
-    cmd = (text or "").split()[0].strip().lower()
+    """Нормализация команды"""
+    if not text:
+        return ""
+    cmd = text.split()[0].strip().lower()
     if "@" in cmd:
         cmd = cmd.split("@", 1)[0]
     return cmd
 
-def is_group_chat(chat_id) -> bool:
-    # В Telegram супергруппы обычно имеют отрицательный int id.
-    if isinstance(chat_id, int) and chat_id < 0:
-        return True
-    if isinstance(chat_id, str) and (chat_id.startswith("@") or chat_id.startswith("-100")):
-        return True
-    return False
-
 def safe_username(user_id: int) -> str:
-    u = users.get(user_id, {})
-    username = u.get("username")
+    """Безопасное получение username"""
+    user = users.get(user_id, {})
+    username = user.get("username")
     if username:
         return "@" + username
-    name = (u.get("first_name", "") + " " + u.get("last_name", "")).strip()
+    name = (user.get("first_name", "") + " " + user.get("last_name", "")).strip()
     return name if name else f"пользователь {user_id}"
 
 def parse_domain(url: str) -> str:
+    """Парсинг домена из URL"""
     try:
-        p = urlparse(url.strip())
-        return (p.netloc or "").lower()
+        parsed = urlparse(url.strip())
+        return (parsed.netloc or "").lower()
     except Exception:
         return ""
 
 def is_allowed_article_url(url: str) -> bool:
+    """Проверка допустимости URL"""
     if not url or not isinstance(url, str):
         return False
+    
     url = url.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         return False
+    
     domain = parse_domain(url)
     if not domain:
         return False
-    # нормализуем www.
+    
+    # Убираем www.
     if domain.startswith("www."):
         domain = domain[4:]
-    if domain in ALLOWED_DOMAINS:
-        return True
-    # на всякий случай разрешим поддомены
-    for d in ALLOWED_DOMAINS:
-        if domain.endswith("." + d):
+    
+    # Проверяем домен и поддомены
+    for allowed_domain in ALLOWED_DOMAINS:
+        if domain == allowed_domain or domain.endswith("." + allowed_domain):
             return True
+    
     return False
 
 # =========================
-# PERSISTENCE
-# =========================
-
-def save_data():
-    with DATA_LOCK:
-        payload = {
-            "users": users,
-            "articles_queue": list(articles_queue),
-            "published_articles": published_articles,
-            "user_articles": dict(user_articles),
-            "user_balances": dict(user_balances),
-            "user_last_submit": {str(k): v.isoformat() for k, v in user_last_submit.items()},
-            "user_daily_reward": user_daily_reward,
-            "user_submit_notified": user_submit_notified,
-            "games_history": games_history,
-            "games_results": games_results,
-            "games_pin_message_id": games_pin_message_id,
-            "duels": duels,
-            "dice_games": dice_games,
-            "topic_menu_message_ids": topic_menu_message_ids,
-        }
-        try:
-            with open(DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error("save_data error: %s", e)
-
-def load_data():
-    global users, articles_queue, published_articles, user_articles
-    global user_balances, user_last_submit, user_daily_reward, user_submit_notified
-    global games_history, games_results, games_pin_message_id, duels
-    global dice_games, topic_menu_message_ids
-
-    if not os.path.exists(DATA_FILE):
-        return
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        users = data.get("users", {})
-        articles_queue = deque(data.get("articles_queue", []), maxlen=10)
-        published_articles = data.get("published_articles", [])
-        user_articles = defaultdict(list, data.get("user_articles", {}))
-        user_balances = defaultdict(int, data.get("user_balances", {}))
-        user_last_submit = {
-            int(k): datetime.fromisoformat(v) for k, v in data.get("user_last_submit", {}).items()
-        }
-        user_daily_reward = data.get("user_daily_reward", {})
-        user_submit_notified = data.get("user_submit_notified", {})
-        games_history = data.get("games_history", [])
-        games_results = data.get("games_results", [])
-        games_pin_message_id = data.get("games_pin_message_id")
-        duels = data.get("duels", [])
-        dice_games = data.get("dice_games", {})
-        topic_menu_message_ids = data.get("topic_menu_message_ids", {})
-        logger.info("✅ Данные загружены")
-    except Exception as e:
-        logger.error("load_data error: %s", e)
-
-def schedule_data_saves(interval_seconds=60):
-    def loop():
-        while True:
-            time.sleep(interval_seconds)
-            save_data()
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
-
-# =========================
-# CLEAN UI (удаляем прошлое сообщение бота для конкретного пользователя)
-# =========================
-
-def send_clean_ui(chat_id, user_id, text, topic_id=None, reply_markup=None, ttl_seconds=None):
-    key = (int(user_id), str(chat_id), int(topic_id or 0))
-    old_id = user_last_ui_message.get(key)
-    if old_id:
-        delete_telegram_message(chat_id, old_id)
-
-    result = send_telegram_message(chat_id, text, topic_id=topic_id, reply_markup=reply_markup)
-    if result and result.get("ok") and result.get("result", {}).get("message_id"):
-        mid = result["result"]["message_id"]
-        user_last_ui_message[key] = mid
-        if ttl_seconds:
-            threading.Timer(ttl_seconds, delete_telegram_message, args=[chat_id, mid]).start()
-    return result
-
-# =========================
-# KEYBOARDS
-# =========================
-
-def build_main_menu_inline():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "📜 Правила", "callback_data": "menu_rules"},
-                {"text": "📋 Очередь", "callback_data": "menu_queue"},
-            ],
-            [
-                {"text": "👤 Профиль", "callback_data": "menu_profile"},
-                {"text": "💰 Баланс", "callback_data": "menu_balance"},
-            ],
-            [
-                {"text": "🎮 Игры", "callback_data": "menu_games"},
-                {"text": "🛒 Магазин", "callback_data": "menu_shop"},
-            ],
-            [
-                {"text": "✍️ Подать статью", "callback_data": "menu_submit"},
-                {"text": "🏆 Топ", "callback_data": "menu_top"},
-            ],
-        ]
-    }
-
-def build_private_reply_keyboard():
-    # Это “обычная клавиатура” (ReplyKeyboardMarkup). В личке удобно, в группе хуже.
-    return {
-        "keyboard": [
-            ["📜 Правила", "📋 Очередь"],
-            ["👤 Профиль", "💰 Баланс"],
-            ["🎮 Игры", "🛒 Магазин"],
-            ["✍️ Подать статью", "🏆 Топ"],
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-        "input_field_placeholder": "Выбери действие кнопкой или напиши /help",
-    }
-
-def topic_menu_keyboard(topic_key: str):
-    common = [
-        {"text": "💰 Баланс", "callback_data": "m:balance"},
-        {"text": "👤 Профиль", "callback_data": "m:profile"},
-    ]
-
-    if topic_key == "rules":
-        return {"inline_keyboard": [
-            [{"text": "📜 Правила (кратко)", "callback_data": "m:rules_short"}],
-            [{"text": "🧭 Как все устроено", "callback_data": "m:how_it_works"}],
-            common
-        ]}
-
-    if topic_key == "queue":
-        return {"inline_keyboard": [
-            [{"text": "📋 Показать очередь", "callback_data": "m:queue"}],
-            [{"text": "✍️ Подать статью (в личку)", "callback_data": "m:submit_hint"}],
-            common
-        ]}
-
-    if topic_key == "reading_list":
-        return {"inline_keyboard": [
-            [{"text": "📚 Лист чтения (сегодня)", "callback_data": "m:reading_today"}],
-            [{"text": "🔔 Напомнить про подачу", "callback_data": "m:submit_remind"}],
-            common
-        ]}
-
-    if topic_key == "feedback":
-        return {"inline_keyboard": [
-            [{"text": "💬 Как дать фидбек", "callback_data": "m:feedback_how"}],
-            [{"text": "🎁 Награда за фидбек", "callback_data": "m:feedback_reward"}],
-            common
-        ]}
-
-    if topic_key == "duels":
-        return {"inline_keyboard": [
-            [{"text": "⚔️ Начать дуэль", "callback_data": "m:duel_start"}],
-            [{"text": "📌 Как участвовать", "callback_data": "m:duel_how"}],
-            common
-        ]}
-
-    if topic_key == "games":
-        return {"inline_keyboard": [
-            [{"text": "🎲 Кости (ставки)", "callback_data": "m:dice"}],
-            [{"text": "🤥 Правда или выдумка", "callback_data": "m:truth"}],
-            [{"text": "🎡 Колесо тем", "callback_data": "m:wheel"}],
-            [{"text": "🏆 Результаты игр", "callback_data": "m:games_results"}],
-            common
-        ]}
-
-    if topic_key == "shop":
-        return {"inline_keyboard": [
-            [{"text": "🛒 Витрина", "callback_data": "m:shop_show"}],
-            [{"text": "🎁 Купить", "callback_data": "m:shop_buy"}],
-            common
-        ]}
-
-    if topic_key == "offtop":
-        return {"inline_keyboard": [
-            [{"text": "😄 Шутка дня", "callback_data": "m:joke"}],
-            common
-        ]}
-
-    return {"inline_keyboard": [common]}
-
-def topic_menu_text(topic_key: str) -> str:
-    if topic_key == "rules":
-        return (
-            "📜 <b>Правила и FAQ</b>\n\n"
-            "Тут все по-взрослому, но без занудства.\n"
-            "Очередь, лист чтения, фидбек, игры и кавычки 🪙.\n"
-            f"Ссылки принимаем только: <b>{ALLOWED_PLATFORMS_TEXT}</b>.\n"
-        )
-    if topic_key == "queue":
-        return (
-            "📋 <b>Очередь публикаций</b>\n\n"
-            "Порядок спасает нервы. И авторов тоже.\n"
-            "Ограничение: 1 ссылка раз в 48-72 часа, 1 активная ссылка на участника.\n"
-        )
-    if topic_key == "reading_list":
-        return (
-            "📚 <b>Лист чтения</b>\n\n"
-            "Каждый день в 19:00 МСК публикуем лист на 5-10 ссылок.\n"
-            "Читаем его, а не превращаем чат в свалку ссылок.\n"
-        )
-    if topic_key == "feedback":
-        return (
-            "💬 <b>Фидбек</b>\n\n"
-            "Можно быть строгим к тексту. Нельзя быть токсичным к человеку.\n"
-            "Комментарий уровня “норм” не считается фидбеком. Да, жизнь жестока.\n"
-        )
-    if topic_key == "duels":
-        return (
-            "⚔️ <b>Дуэли</b>\n\n"
-            "Дуэль абзацев: тема, таймер, голосование, приз.\n"
-            "Пишем коротко, бодро, без взаимного поедания.\n"
-        )
-    if topic_key == "games":
-        return (
-            "🎮 <b>Игры дня</b>\n\n"
-            "Игры нужны, чтобы клуб не превращался в обязаловку.\n"
-            "Тут есть факты, темы и кости со ставками. Да, мы взрослые люди. Почти.\n"
-        )
-    if topic_key == "shop":
-        return (
-            "🛒 <b>Магазин</b>\n\n"
-            "Тут тратятся “Кавычки” 🪙.\n"
-            "Пока витрина небольшая, но будет веселее. Люди любят кнопки и блестяшки.\n"
-        )
-    if topic_key == "offtop":
-        return (
-            "😄 <b>Оффтоп</b>\n\n"
-            "Иногда надо выдохнуть. Тут можно шутки, курьезы и просто поболтать.\n"
-        )
-    return "📌 <b>Меню</b>"
-
-def ensure_topic_menu(topic_key: str):
-    if topic_key not in GROUP_TOPICS:
-        return
-    topic_id = GROUP_TOPICS[topic_key]
-    text = topic_menu_text(topic_key)
-    kb = topic_menu_keyboard(topic_key)
-
-    existing_id = topic_menu_message_ids.get(topic_key)
-
-    # Пытаемся обновить существующее
-    if existing_id:
-        res = edit_message_text(GROUP_ID, existing_id, text, reply_markup=kb)
-        if res and res.get("ok"):
-            return
-
-    # Создаем новое
-    res = send_telegram_message(GROUP_ID, text, topic_id=topic_id, reply_markup=kb)
-    if res and res.get("ok") and res.get("result", {}).get("message_id"):
-        mid = res["result"]["message_id"]
-        topic_menu_message_ids[topic_key] = mid
-        pin_message(GROUP_ID, mid, disable_notification=True)
-
-def ensure_all_topic_menus():
-    for k in GROUP_TOPICS.keys():
-        ensure_topic_menu(k)
-
-# =========================
-# USERS
+# РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЕЙ
 # =========================
 
 def is_user_registered(user_id: int) -> bool:
-    return int(user_id) in users
+    """Проверка регистрации пользователя"""
+    return user_id in users
 
 def register_user(user_data: dict) -> bool:
+    """Регистрация нового пользователя"""
     user_id = int(user_data["id"])
+    
     if user_id in users:
         return True
-
+    
     users[user_id] = {
         "id": user_id,
         "username": user_data.get("username"),
@@ -525,1011 +195,541 @@ def register_user(user_data: dict) -> bool:
         "registered_at": datetime.now().isoformat(),
         "articles_count": 0,
         "feedback_given": 0,
-        "feedback_received": 0,
         "games_played": 0,
-        "duels_won": 0,
-        "dice_wins": 0,
-        "dice_losses": 0,
-        "total_quotes": 0,
+        "total_quotes": 50,
         "badges": ["новичок"],
-        "subscription": "free",
         "last_active": datetime.now().isoformat()
     }
-    user_balances[user_id] = 50
+    
+    user_balances[user_id] = 50  # Стартовый бонус
+    
+    welcome_text = f"""📚 <b>Увлекательные чтения</b>
 
-    # Привет в личку + reply-клавиатура
-    send_telegram_message(
-        user_id,
-        WELCOME_PRIVATE,
-        reply_markup=build_private_reply_keyboard()
-    )
+Добро пожаловать в клуб, где ценят реальные отзывы, а не обмен лайками!
 
-    logger.info("✅ Зарегистрирован новый пользователь: %s", user_id)
+🎯 <b>Как начать:</b>
+1. <b>/daily</b> - ежедневная награда (5 кавычек)
+2. <b>/balance</b> - проверить баланс
+3. <b>/queue</b> - посмотреть очередь статей (в группе)
+4. <b>/submit</b> - подать свою статью
+
+📜 <b>Правила:</b>
+• 1 статья раз в 48-72 часа
+• Ссылки только: {ALLOWED_PLATFORMS_TEXT}
+• Реальные отзывы, а не "норм"
+
+💰 <b>Баланс:</b> 50 кавычек (стартовый бонус)
+
+Пиши <b>/help</b> для списка команд!"""
+    
+    send_telegram_message(user_id, welcome_text)
+    logger.info(f"✅ Зарегистрирован новый пользователь: {user_id}")
     return True
 
 # =========================
-# QUOTES / ACHIEVEMENTS
+# СИСТЕМА КАВЫЧЕК
 # =========================
 
-def add_quotes(user_id: int, amount: int, reason: str):
+def add_quotes(user_id: int, amount: int, reason: str) -> int:
+    """Начисление кавычек"""
     user_id = int(user_id)
-    user_balances[user_id] += int(amount)
+    user_balances[user_id] = user_balances.get(user_id, 0) + int(amount)
+    
     if user_id in users:
-        users[user_id]["total_quotes"] += int(amount)
-        check_achievements(user_id)
-    logger.info("💰 %s: %+d кавычек (%s)", user_id, amount, reason)
+        users[user_id]["total_quotes"] = users[user_id].get("total_quotes", 0) + int(amount)
+    
+    logger.info(f"💰 {user_id}: +{amount} кавычек ({reason})")
     return user_balances[user_id]
 
-def spend_quotes(user_id: int, amount: int, reason: str):
+def spend_quotes(user_id: int, amount: int, reason: str) -> bool:
+    """Списание кавычек"""
     user_id = int(user_id)
     amount = int(amount)
-    if user_balances[user_id] < amount:
+    
+    if user_balances.get(user_id, 0) < amount:
         return False
+    
     user_balances[user_id] -= amount
-    logger.info("🪙 %s: -%d кавычек (%s)", user_id, amount, reason)
+    logger.info(f"🪙 {user_id}: -{amount} кавычек ({reason})")
     return True
 
-def check_achievements(user_id: int):
-    user = users.get(user_id)
-    if not user:
-        return
-    new_badges = []
-
-    tq = user.get("total_quotes", 0)
-    if tq >= 1000 and "магнат" not in user["badges"]:
-        new_badges.append("магнат")
-    elif tq >= 500 and "богач" not in user["badges"]:
-        new_badges.append("богач")
-    elif tq >= 100 and "состоятельный" not in user["badges"]:
-        new_badges.append("состоятельный")
-
-    ac = user.get("articles_count", 0)
-    if ac >= 50 and "прозаик" not in user["badges"]:
-        new_badges.append("прозаик")
-    elif ac >= 20 and "писатель" not in user["badges"]:
-        new_badges.append("писатель")
-    elif ac >= 10 and "автор" not in user["badges"]:
-        new_badges.append("автор")
-
-    fg = user.get("feedback_given", 0)
-    if fg >= 100 and "наставник" not in user["badges"]:
-        new_badges.append("наставник")
-    elif fg >= 50 and "критик" not in user["badges"]:
-        new_badges.append("критик")
-    elif fg >= 20 and "читатель" not in user["badges"]:
-        new_badges.append("читатель")
-
-    for b in new_badges:
-        if b not in user["badges"]:
-            user["badges"].append(b)
-            send_telegram_message(
-                user_id,
-                f"🎖 <b>Новый бейдж!</b>\n\n<b>{html_escape(b.upper())}</b>\n\nПродолжай, человек. Это почти похвала 🙂"
-            )
-
 # =========================
-# QUEUE / SUBMIT
+# ОЧЕРЕДЬ СТАТЕЙ
 # =========================
 
 def can_submit_article(user_id: int):
+    """Проверка возможности подачи статьи"""
     user_id = int(user_id)
+    
+    # Если пользователь никогда не подавал
     if user_id not in user_last_submit:
-        return True, "Можно подавать"
-
+        return True, "✅ Можно подавать статью"
+    
     last_submit = user_last_submit[user_id]
     time_diff = datetime.now() - last_submit
-
+    
+    # Минимум 48 часов между подачами
     min_hours = 48
     if time_diff.total_seconds() < min_hours * 3600:
         hours_left = int((min_hours * 3600 - time_diff.total_seconds()) / 3600)
-        return False, f"⏳ Можно будет подать через {hours_left} ч."
-
-    if any(a["user_id"] == user_id for a in articles_queue):
-        return False, "⚠️ У тебя уже есть ссылка в очереди"
-
+        return False, f"⏳ Можно будет подать через {hours_left} часов"
+    
+    # Максимум 1 активная статья в очереди
+    if any(article["user_id"] == user_id for article in articles_queue):
+        return False, "⚠️ У тебя уже есть статья в очереди"
+    
+    # Максимум 10 статей в очереди
     if len(articles_queue) >= 10:
-        return False, "📦 Очередь забита (макс 10). Загляни позже."
+        return False, "📦 Очередь заполнена (максимум 10 статей)"
+    
+    return True, "✅ Можно подавать статью"
 
-    return True, "Можно подавать"
-
-def add_article_to_queue(user_id: int, title: str, description: str, url: str):
+def add_article_to_queue(user_id: int, title: str, description: str, url: str) -> str:
+    """Добавление статьи в очередь"""
     user_id = int(user_id)
     article_id = f"art_{int(time.time())}_{user_id}"
-
+    
     article = {
         "id": article_id,
         "user_id": user_id,
         "title": title[:120],
         "description": description[:600],
-        "content": url,
+        "url": url,
         "submitted_at": datetime.now().isoformat(),
         "status": "pending",
-        "feedback_count": 0,
-        "reads": 0,
-        "likes": 0
+        "feedback_count": 0
     }
-
+    
     articles_queue.append(article)
     user_articles[user_id].append(article)
     user_last_submit[user_id] = datetime.now()
-    user_submit_notified[user_id] = ""  # сбросим уведомление, чтобы потом напомнить
-
+    
+    # Награда за подачу
     add_quotes(user_id, 10, "Подача статьи")
     if user_id in users:
-        users[user_id]["articles_count"] += 1
-
-    logger.info("📝 Добавлено в очередь: %s", article_id)
+        users[user_id]["articles_count"] = users[user_id].get("articles_count", 0) + 1
+    
+    logger.info(f"📝 Добавлено в очередь: {article_id}")
     return article_id
 
-def start_article_submission(user_id: int):
-    can_submit, msg = can_submit_article(user_id)
-    if not can_submit:
-        send_telegram_message(user_id, msg)
-        return
-
-    user_states[int(user_id)] = {"state": "await_article", "started_at": datetime.now().isoformat()}
-
-    text = (
-        "✍️ <b>Подача статьи</b>\n\n"
-        "Ссылки принимаем только: <b>{}</b>\n"
-        "Формат сообщения такой:\n\n"
-        "<b>ЗАГОЛОВОК</b>\n"
-        "Твой заголовок\n\n"
-        "<b>ОПИСАНИЕ</b>\n"
-        "2-3 предложения, по делу\n\n"
-        "<b>ССЫЛКА</b>\n"
-        "https://...\n\n"
-        "Подсказка: “норм” не считается описанием 🙂"
-    ).format(ALLOWED_PLATFORMS_TEXT)
-
-    send_telegram_message(user_id, text)
-
 def parse_submission_text(text: str):
-    # Пытаемся вытащить блоки ЗАГОЛОВОК / ОПИСАНИЕ / ССЫЛКА
-    t = (text or "").strip()
-    # Упростим: ищем маркеры по строкам
-    def block(name):
-        pattern = rf"{name}\s*\n(.+?)(?=\n[A-ZА-ЯЁ ]+\n|\Z)"
-        m = re.search(pattern, t, flags=re.S | re.I)
-        return m.group(1).strip() if m else ""
-
-    title = block("ЗАГОЛОВОК")
-    desc = block("ОПИСАНИЕ")
-    link = block("ССЫЛКА").split()[0].strip() if block("ССЫЛКА") else ""
-
-    return title, desc, link
-
-# =========================
-# READING LIST
-# =========================
-
-def publish_daily_reading_list():
-    if not articles_queue:
-        return "📭 Очередь пустая"
-
-    today_articles = list(articles_queue)[:10]  # 5-10
-
-    header = f"📚 <b>Лист чтения на {datetime.now().strftime('%d.%m.%Y')}</b>\n\n"
-    body = "Сегодня читаем вот это:\n"
-    lines = []
-
-    for i, a in enumerate(today_articles, 1):
-        author = safe_username(a["user_id"])
-        title = html_escape(a["title"])
-        desc = html_escape(a["description"][:160])
-        url = a["content"]
-        lines.append(
-            f"\n<b>{i}. {title}</b>\n"
-            f"Автор: {html_escape(author)}\n"
-            f"{desc}\n"
-            f"<a href=\"{html_escape(url)}\">Открыть статью</a>"
-        )
-
-    footer = (
-        "\n\n<b>Задание на сегодня</b>\n"
-        "1) Прочитай минимум 1 статью\n"
-        "2) Оставь нормальный фидбек\n"
-        "3) Забери кавычки 🪙\n\n"
-        "Фидбек можно оставлять до 23:59 МСК.\n"
-        "И да, клуб не кусается. Максимум слегка стыдит 🙂"
-    )
-
-    text = header + body + "".join(lines) + footer
-
-    send_telegram_message(GROUP_ID, text, topic_id=GROUP_TOPICS["reading_list"])
-
-    # помечаем опубликованные
-    for a in today_articles:
-        a["status"] = "published"
-        a["published_at"] = datetime.now().isoformat()
-        published_articles.append(a)
-
-    for _ in range(len(today_articles)):
-        if articles_queue:
-            articles_queue.popleft()
-
-    return f"Опубликовано {len(today_articles)}"
+    """Парсинг текста подачи статьи"""
+    text = (text or "").strip()
+    
+    # Ищем блоки по маркерам
+    def get_block(marker):
+        pattern = rf"{marker}\s*\n(.+?)(?=\n[A-ZА-ЯЁ]+\n|\Z)"
+        match = re.search(pattern, text, flags=re.S | re.I)
+        return match.group(1).strip() if match else ""
+    
+    title = get_block("ЗАГОЛОВОК")
+    description = get_block("ОПИСАНИЕ")
+    link = get_block("ССЫЛКА").split()[0].strip() if get_block("ССЫЛКА") else ""
+    
+    return title, description, link
 
 # =========================
-# TOP / PROFILE / BALANCE
-# =========================
-
-def get_user_top(limit=10):
-    rows = []
-    for uid, u in users.items():
-        rows.append({
-            "id": int(uid),
-            "name": u.get("first_name", ""),
-            "username": u.get("username"),
-            "articles": u.get("articles_count", 0),
-            "quotes": int(user_balances.get(int(uid), 0)),
-            "feedback_given": u.get("feedback_given", 0),
-        })
-    rows.sort(key=lambda x: x["quotes"], reverse=True)
-    return rows[:limit]
-
-def show_profile(user_id: int, chat_id=None, topic_id=None, as_clean_ui=False):
-    user_id = int(user_id)
-    if user_id not in users:
-        send_telegram_message(user_id, "Сначала /start в личке. Telegram не умеет читать мысли.")
-        return
-
-    u = users[user_id]
-    total_users = max(1, len(users))
-    ranked = get_user_top(total_users)
-    rank = next((i+1 for i, r in enumerate(ranked) if r["id"] == user_id), total_users)
-
-    text = (
-        "👤 <b>Профиль</b>\n\n"
-        f"Имя: {html_escape((u.get('first_name','')+' '+u.get('last_name','')).strip())}\n"
-        f"Юзернейм: @{html_escape(u.get('username') or 'не установлен')}\n"
-        f"Рейтинг: #{rank} из {total_users}\n\n"
-        "Статистика:\n"
-        f"- Статей: {u.get('articles_count',0)}\n"
-        f"- Фидбеков дано: {u.get('feedback_given',0)}\n"
-        f"- Дуэлей выиграно: {u.get('duels_won',0)}\n"
-        f"- Кости: побед {u.get('dice_wins',0)}, поражений {u.get('dice_losses',0)}\n"
-        f"- Баланс: {user_balances.get(user_id,0)} кавычек 🪙\n\n"
-        f"Бейджи: {', '.join(u.get('badges', []) )}"
-    )
-
-    if chat_id is None:
-        chat_id = user_id
-
-    if as_clean_ui:
-        send_clean_ui(chat_id, user_id, text, topic_id=topic_id, ttl_seconds=90)
-    else:
-        send_telegram_message(chat_id, text, topic_id=topic_id)
-
-def show_top(chat_id, topic_id=None):
-    top = get_user_top(10)
-    if not top:
-        send_telegram_message(chat_id, "Пока топ пустой. Это редкий шанс стать легендой.")
-        return
-
-    medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-    lines = ["🏆 <b>Топ участников</b>\n"]
-    for i, u in enumerate(top):
-        medal = medals[i] if i < len(medals) else f"{i+1}."
-        name = ("@" + u["username"]) if u.get("username") else u.get("name") or str(u["id"])
-        lines.append(f"{medal} <b>{html_escape(name)}</b> - {u['quotes']} 🪙, статей {u['articles']}, фидбеков {u['feedback_given']}")
-    send_telegram_message(chat_id, "\n".join(lines), topic_id=topic_id)
-
-def show_queue(chat_id, topic_id=None):
-    if not articles_queue:
-        send_telegram_message(chat_id, "📭 Очередь пустая. Редкое состояние гармонии.", topic_id=topic_id)
-        return
-
-    lines = ["📋 <b>Очередь публикаций</b>\n"]
-    for i, a in enumerate(list(articles_queue)[:10], 1):
-        author = safe_username(a["user_id"])
-        title = html_escape(a["title"])
-        lines.append(f"{i}. <b>{title}</b> (автор {html_escape(author)})")
-
-    lines.append(f"\nВсего в очереди: {len(articles_queue)} из 10")
-    send_telegram_message(chat_id, "\n".join(lines), topic_id=topic_id)
-
-# =========================
-# DAILY REWARD
-# =========================
-
-def give_daily_reward(user_id: int):
-    user_id = int(user_id)
-    today = datetime.now().date().isoformat()
-
-    if user_daily_reward.get(str(user_id)) == today or user_daily_reward.get(user_id) == today:
-        send_telegram_message(user_id, "⏳ Награда уже была сегодня. Завтра снова можно.")
-        return
-
-    reward = 5
-    add_quotes(user_id, reward, "Ежедневная награда")
-    user_daily_reward[user_id] = today
-
-    send_telegram_message(
-        user_id,
-        f"🎁 <b>Ежедневная награда</b>\n\n+{reward} кавычек 🪙\nБаланс: {user_balances.get(user_id,0)}\n\nВозвращайся завтра. Ритуалы это основа цивилизации 🙂"
-    )
-
-# =========================
-# GAMES PIN (результаты)
-# =========================
-
-def update_games_pin():
-    global games_pin_message_id
-
-    if not games_results:
-        pin_text = "🏆 <b>Результаты игр</b>\n\nПока нет завершенных игр. Стыдно, но переживем."
-    else:
-        lines = ["🏆 <b>Результаты игр</b>\n"]
-        for r in games_results[-10:]:
-            winners = ", ".join(r.get("winners", [])) if r.get("winners") else "нет победителей"
-            lines.append(f"• <b>{html_escape(r.get('title','Игра'))}</b> ({html_escape(r.get('date',''))})\n  Победители: {html_escape(winners)}")
-        pin_text = "\n".join(lines)
-
-    topic_id = GROUP_TOPICS["games"]
-    if games_pin_message_id:
-        edit_message_text(GROUP_ID, games_pin_message_id, pin_text)
-        return
-
-    res = send_telegram_message(GROUP_ID, pin_text, topic_id=topic_id)
-    if res and res.get("ok") and res.get("result", {}).get("message_id"):
-        games_pin_message_id = res["result"]["message_id"]
-        pin_message(GROUP_ID, games_pin_message_id, disable_notification=True)
-
-# =========================
-# DICE GAME (ставки)
-# =========================
-
-def dice_stake_picker_keyboard():
-    return {
-        "inline_keyboard": [[
-            {"text": "5 🪙", "callback_data": "dice:new:5"},
-            {"text": "10 🪙", "callback_data": "dice:new:10"},
-            {"text": "20 🪙", "callback_data": "dice:new:20"},
-            {"text": "50 🪙", "callback_data": "dice:new:50"},
-        ]]
-    }
-
-def dice_challenge_keyboard(game_id: str):
-    return {
-        "inline_keyboard": [[
-            {"text": "✅ Принять", "callback_data": f"dice:join:{game_id}"},
-            {"text": "🚫 Отмена", "callback_data": f"dice:cancel:{game_id}"},
-        ]]
-    }
-
-def start_dice_challenge(creator_id: int, stake: int):
-    creator_id = int(creator_id)
-    stake = int(stake)
-
-    if user_balances.get(creator_id, 0) < stake:
-        return None, "Не хватает кавычек на ставку. Это не бедность, это сюжет."
-
-    game_id = f"dice_{int(time.time())}_{creator_id}"
-    dice_games[game_id] = {
-        "id": game_id,
-        "creator_id": creator_id,
-        "stake": stake,
-        "status": "open",
-        "created_at": datetime.now().isoformat(),
-        "message_id": None,
-        "acceptor_id": None,
-    }
-
-    text = (
-        "🎲 <b>Дуэль костей</b>\n\n"
-        f"Игрок: {html_escape(safe_username(creator_id))}\n"
-        f"Ставка: <b>{stake} кавычек</b> 🪙\n\n"
-        "Кто смелый, жми “Принять”. Победитель забирает банк.\n"
-        "Если ничья, переброс (один раз)."
-    )
-
-    res = send_telegram_message(GROUP_ID, text, topic_id=GROUP_TOPICS["games"], reply_markup=dice_challenge_keyboard(game_id))
-    if res and res.get("ok") and res.get("result", {}).get("message_id"):
-        dice_games[game_id]["message_id"] = res["result"]["message_id"]
-        return game_id, "Создано"
-    return None, "Не удалось создать игру (Telegram сегодня в настроении)."
-
-def finish_dice_game(game_id: str, winner_id: int, loser_id: int, stake: int, v1: int, v2: int):
-    winner_id = int(winner_id)
-    loser_id = int(loser_id)
-    stake = int(stake)
-
-    add_quotes(winner_id, stake * 2, "Победа в костях")
-    if winner_id in users:
-        users[winner_id]["dice_wins"] = users[winner_id].get("dice_wins", 0) + 1
-    if loser_id in users:
-        users[loser_id]["dice_losses"] = users[loser_id].get("dice_losses", 0) + 1
-
-    winners_names = [safe_username(winner_id)]
-    games_results.append({
-        "title": "Кости",
-        "date": datetime.now().strftime("%d.%m.%Y"),
-        "winners": winners_names,
-    })
-    update_games_pin()
-
-def accept_dice_challenge(game_id: str, acceptor_id: int):
-    acceptor_id = int(acceptor_id)
-    g = dice_games.get(game_id)
-    if not g or g.get("status") != "open":
-        return False, "Игра уже не доступна."
-
-    creator_id = int(g["creator_id"])
-    if acceptor_id == creator_id:
-        return False, "Играть с самим собой можно, но это уже психология, не игры."
-
-    stake = int(g["stake"])
-    if user_balances.get(creator_id, 0) < stake:
-        return False, "У создателя ставки уже нет кавычек. Мистика."
-    if user_balances.get(acceptor_id, 0) < stake:
-        return False, "Тебе не хватает кавычек на ставку."
-
-    # Блокируем ставки: списываем у обоих в банк
-    spend_quotes(creator_id, stake, "Ставка в костях")
-    spend_quotes(acceptor_id, stake, "Ставка в костях")
-
-    g["status"] = "playing"
-    g["acceptor_id"] = acceptor_id
-
-    # Роллы через sendDice
-    d1 = send_dice(GROUP_ID, topic_id=GROUP_TOPICS["games"], emoji="🎲")
-    v1 = None
-    if d1 and d1.get("ok"):
-        v1 = d1["result"]["dice"]["value"]
-
-    d2 = send_dice(GROUP_ID, topic_id=GROUP_TOPICS["games"], emoji="🎲")
-    v2 = None
-    if d2 and d2.get("ok"):
-        v2 = d2["result"]["dice"]["value"]
-
-    if not v1 or not v2:
-        # если Telegram не отдал значения, честно вернем деньги
-        add_quotes(creator_id, stake, "Возврат ставки (ошибка dice)")
-        add_quotes(acceptor_id, stake, "Возврат ставки (ошибка dice)")
-        g["status"] = "cancelled"
-        return False, "Dice не сработал. Ставки возвращены."
-
-    # Ничья: один переброс
-    if v1 == v2:
-        d1b = send_dice(GROUP_ID, topic_id=GROUP_TOPICS["games"], emoji="🎲")
-        d2b = send_dice(GROUP_ID, topic_id=GROUP_TOPICS["games"], emoji="🎲")
-        if d1b and d1b.get("ok"):
-            v1 = d1b["result"]["dice"]["value"]
-        if d2b and d2b.get("ok"):
-            v2 = d2b["result"]["dice"]["value"]
-
-    if v1 > v2:
-        winner, loser = creator_id, acceptor_id
-    elif v2 > v1:
-        winner, loser = acceptor_id, creator_id
-    else:
-        # снова ничья: возвращаем
-        add_quotes(creator_id, stake, "Возврат ставки (ничья)")
-        add_quotes(acceptor_id, stake, "Возврат ставки (ничья)")
-        g["status"] = "finished"
-        return True, "Ничья. Ставки возвращены."
-
-    finish_dice_game(game_id, winner, loser, stake, v1, v2)
-    g["status"] = "finished"
-
-    # Обновим исходное сообщение игры
-    mid = g.get("message_id")
-    if mid:
-        text = (
-            "🎲 <b>Дуэль костей завершена</b>\n\n"
-            f"{html_escape(safe_username(creator_id))}: {v1}\n"
-            f"{html_escape(safe_username(acceptor_id))}: {v2}\n\n"
-            f"Победитель: <b>{html_escape(safe_username(winner))}</b>\n"
-            f"Приз: <b>{stake*2} кавычек</b> 🪙\n"
-        )
-        edit_message_text(GROUP_ID, mid, text, reply_markup={"inline_keyboard": []})
-
-    return True, "Сыграно"
-
-def cancel_dice_game(game_id: str, requester_id: int):
-    requester_id = int(requester_id)
-    g = dice_games.get(game_id)
-    if not g:
-        return False, "Не нашел игру."
-
-    if requester_id != int(g["creator_id"]) and requester_id not in ADMIN_IDS:
-        return False, "Отменять может создатель или админ."
-
-    if g.get("status") != "open":
-        return False, "Эта игра уже началась или закончилась."
-
-    g["status"] = "cancelled"
-    mid = g.get("message_id")
-    if mid:
-        edit_message_text(GROUP_ID, mid, "🎲 Игра отменена. Никто не пострадал. Почти.", reply_markup={"inline_keyboard": []})
-    return True, "Отменено"
-
-# =========================
-# SHOP (минимальный MVP)
-# =========================
-
-SHOP_ITEMS = [
-    {"id": "badge_bookworm", "title": "Бейдж: Книжный маньяк", "price": 120, "type": "badge", "value": "книжный маньяк"},
-    {"id": "badge_kind", "title": "Бейдж: Добрая критика", "price": 80, "type": "badge", "value": "добрая критика"},
-]
-
-def shop_list_text():
-    lines = ["🛒 <b>Витрина</b>\n", "Траты делают жизнь ярче. Иногда.\n"]
-    for it in SHOP_ITEMS:
-        lines.append(f"• <b>{html_escape(it['title'])}</b> - {it['price']} 🪙")
-    lines.append("\nПокупки пока простые: бейджи. Дальше будет веселее.")
-    return "\n".join(lines)
-
-def shop_list_keyboard():
-    rows = []
-    for it in SHOP_ITEMS:
-        rows.append([{"text": f"Купить: {it['price']} 🪙", "callback_data": f"shop:buy:{it['id']}"}])
-    return {"inline_keyboard": rows}
-
-def shop_buy(user_id: int, item_id: str):
-    user_id = int(user_id)
-    it = next((x for x in SHOP_ITEMS if x["id"] == item_id), None)
-    if not it:
-        return False, "Товара нет. Как и смысла в этом мире."
-
-    price = int(it["price"])
-    if user_balances.get(user_id, 0) < price:
-        return False, "Не хватает кавычек. Сначала заработай, потом шикуй 🙂"
-
-    ok = spend_quotes(user_id, price, f"Покупка {item_id}")
-    if not ok:
-        return False, "Не вышло списать кавычки."
-
-    if it["type"] == "badge" and user_id in users:
-        badge = it["value"]
-        if badge not in users[user_id]["badges"]:
-            users[user_id]["badges"].append(badge)
-
-    return True, f"Куплено: {it['title']}"
-
-# =========================
-# COMMANDS (личка и группа)
+# КОМАНДЫ ДЛЯ ЛИЧНЫХ СООБЩЕНИЙ
 # =========================
 
 def show_help(chat_id):
-    text = (
-        "📚 <b>Помощь</b>\n\n"
-        "Главное:\n"
-        "/start - регистрация\n"
-        "/help - помощь\n\n"
-        "Для автора (в личке):\n"
-        "/submit - подать статью\n"
-        "/profile - профиль\n"
-        "/balance - баланс\n"
-        "/daily - ежедневная награда\n\n"
-        "Для группы:\n"
-        "/queue - очередь\n"
-        "/top - топ\n\n"
-        f"Ссылки на статьи принимаем только: <b>{ALLOWED_PLATFORMS_TEXT}</b>.\n"
-    )
+    """Показать помощь"""
+    text = f"""📚 <b>Помощь по командам</b>
+
+<b>Личные команды:</b>
+/start - регистрация
+/help - помощь
+/profile - профиль
+/balance - баланс кавычек
+/daily - ежедневная награда
+/submit - подать статью
+/my_posts - мои статьи
+
+<b>Команды в группе:</b>
+/queue - очередь статей
+/top - топ участников
+/game - игры дня
+/rules - правила клуба
+
+<b>Важно:</b>
+• Ссылки принимаем только: {ALLOWED_PLATFORMS_TEXT}
+• 1 статья раз в 48-72 часа
+• Реальные отзывы приветствуются
+
+Пиши команды в нужном месте! 🤖"""
     send_telegram_message(chat_id, text)
+
+def show_profile(user_id: int, chat_id=None):
+    """Показать профиль"""
+    if not is_user_registered(user_id):
+        send_telegram_message(user_id, "Сначала зарегистрируйся через /start")
+        return
+    
+    user = users[user_id]
+    balance = user_balances.get(user_id, 0)
+    
+    # Считаем рейтинг
+    all_users = list(users.items())
+    sorted_users = sorted(all_users, key=lambda x: user_balances.get(x[0], 0), reverse=True)
+    rank = next((i+1 for i, (uid, _) in enumerate(sorted_users) if uid == user_id), len(sorted_users))
+    
+    text = f"""👤 <b>Профиль</b>
+
+<b>Имя:</b> {html_escape(user.get('first_name', ''))} {html_escape(user.get('last_name', ''))}
+<b>Юзернейм:</b> @{html_escape(user.get('username', 'нет'))}
+<b>Рейтинг:</b> #{rank} из {len(sorted_users)}
+
+<b>Статистика:</b>
+• Статей подано: {user.get('articles_count', 0)}
+• Фидбеков дано: {user.get('feedback_given', 0)}
+• Игр сыграно: {user.get('games_played', 0)}
+• Баланс: {balance} кавычек 🪙
+
+<b>Бейджи:</b> {', '.join(user.get('badges', ['новичок']))}"""
+    
+    target_chat = chat_id or user_id
+    send_telegram_message(target_chat, text)
 
 def show_rules(chat_id):
-    text = (
-        "📜 <b>Правила клуба</b>\n\n"
-        "Цель: реальные чтения и фидбек, а не спам ссылками.\n\n"
-        "Очередь:\n"
-        "- 1 ссылка раз в 48-72 часа\n"
-        "- 1 активная ссылка на участника\n"
-        "- В день читаем лист, а не 200 ссылок подряд\n\n"
-        f"Ссылки только: <b>{ALLOWED_PLATFORMS_TEXT}</b>\n\n"
-        "Фидбек:\n"
-        "- Можно жестко по тексту\n"
-        "- Нельзя токсично по человеку\n"
-        "- “норм” не фидбек 🙂\n\n"
-        "Игры:\n"
-        "- По желанию, но приветствуются\n"
-        "- Кавычки это валюта для движухи, а не пропуск в рай\n"
-    )
+    """Показать правила"""
+    text = f"""📜 <b>Правила клуба</b>
+
+<b>Основные принципы:</b>
+1. Качество, а не количество
+2. Взаимность: получил фидбек → дай фидбек
+3. Уважение к авторам
+4. Реальная поддержка
+
+<b>Очередь статей:</b>
+• 1 статья раз в 48-72 часа
+• Максимум 1 активная статья в очереди
+• Всего в очереди: до 10 статей
+• Лист чтения публикуется в 19:00 МСК
+
+<b>Ссылки принимаем только:</b>
+{ALLOWED_PLATFORMS_TEXT}
+
+<b>Фидбек:</b>
+• Конструктивная критика
+• Что понравилось/не понравилось
+• "Норм" не считается фидбеком
+
+<b>Игры и активность:</b>
+• Участие в играх поощряется
+• Кавычки начисляются за активность
+• Топ участников обновляется ежедневно
+
+Соблюдай правила, и клуб будет полезным для всех! 🤝"""
     send_telegram_message(chat_id, text)
 
+def show_top(chat_id):
+    """Показать топ участников"""
+    if not users:
+        send_telegram_message(chat_id, "🏆 <b>Топ участников</b>\n\nПока никто не зарегистрирован. Будь первым! 🚀")
+        return
+    
+    # Сортируем по кавычкам
+    top_users = []
+    for user_id, user_data in users.items():
+        top_users.append({
+            "id": user_id,
+            "name": user_data.get("first_name", ""),
+            "username": user_data.get("username"),
+            "quotes": user_balances.get(user_id, 0),
+            "articles": user_data.get("articles_count", 0)
+        })
+    
+    top_users.sort(key=lambda x: x["quotes"], reverse=True)
+    
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    
+    lines = ["🏆 <b>Топ участников</b>\n"]
+    for i, user in enumerate(top_users[:10]):
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        name = f"@{user['username']}" if user['username'] else user['name']
+        lines.append(f"{medal} <b>{html_escape(name)}</b> - {user['quotes']} 🪙 (статей: {user['articles']})")
+    
+    send_telegram_message(chat_id, "\n".join(lines))
+
+def show_queue(chat_id):
+    """Показать очередь статей"""
+    if not articles_queue:
+        send_telegram_message(chat_id, "📭 <b>Очередь публикаций</b>\n\nОчередь пустая. Будь первым, кто подаст статью! ✍️")
+        return
+    
+    lines = ["📋 <b>Очередь публикаций</b>\n"]
+    
+    for i, article in enumerate(list(articles_queue)[:10], 1):
+        author = safe_username(article["user_id"])
+        title = html_escape(article["title"])
+        lines.append(f"{i}. <b>{title}</b>\n   👤 Автор: {html_escape(author)}")
+    
+    lines.append(f"\n<b>Всего в очереди:</b> {len(articles_queue)} из 10")
+    send_telegram_message(chat_id, "\n".join(lines))
+
+def give_daily_reward(user_id: int):
+    """Выдать ежедневную награду"""
+    user_id = int(user_id)
+    today = datetime.now().date().isoformat()
+    
+    # Проверяем, получал ли сегодня
+    if user_daily_reward.get(str(user_id)) == today or user_daily_reward.get(user_id) == today:
+        send_telegram_message(user_id, "⏳ <b>Ежедневная награда</b>\n\nТы уже получал награду сегодня. Возвращайся завтра! 😊")
+        return
+    
+    # Выдаем награду
+    reward = 5
+    new_balance = add_quotes(user_id, reward, "Ежедневная награда")
+    user_daily_reward[user_id] = today
+    
+    send_telegram_message(
+        user_id,
+        f"🎁 <b>Ежедневная награда</b>\n\n+{reward} кавычек 🪙\n<b>Новый баланс:</b> {new_balance}\n\nВозвращайся завтра за новой наградой! 🚀"
+    )
+
+def start_article_submission(user_id: int):
+    """Начать процесс подачи статьи"""
+    can_submit, message = can_submit_article(user_id)
+    if not can_submit:
+        send_telegram_message(user_id, message)
+        return
+    
+    user_states[user_id] = {
+        "state": "awaiting_article",
+        "started_at": datetime.now().isoformat()
+    }
+    
+    text = f"""✍️ <b>Подача статьи</b>
+
+<b>Формат сообщения:</b>
+
+ЗАГОЛОВОК
+Твой заголовок здесь
+
+ОПИСАНИЕ
+2-3 предложения о статье
+
+ССЫЛКА
+https://example.com
+
+<b>Важно:</b>
+• Ссылки принимаем только: {ALLOWED_PLATFORMS_TEXT}
+• Заголовок: до 120 символов
+• Описание: до 600 символов
+• Проверь ссылку перед отправкой
+
+Отправь сообщение в указанном формате."""
+    
+    send_telegram_message(user_id, text)
+
 # =========================
-# CALLBACK HANDLER
+# ИГРЫ
 # =========================
 
-def handle_callback(callback):
-    cb_id = callback["id"]
-    user_id = int(callback["from"]["id"])
-    data = callback.get("data", "")
-    msg = callback.get("message", {})
-    chat_id = msg.get("chat", {}).get("id", user_id)
-    topic_id = msg.get("message_thread_id")
+def show_games_menu(chat_id):
+    """Показать меню игр"""
+    text = """🎮 <b>Игры дня</b>
 
-    # Обновим активность
-    if user_id in users:
-        users[user_id]["last_active"] = datetime.now().isoformat()
+Выбери игру для участия:
 
-    # Баланс - лучше всплывашка
-    if data == "menu_balance" or data == "m:balance":
-        bal = user_balances.get(user_id, 0)
-        answer_callback(cb_id, f"Баланс: {bal} 🪙", show_alert=True)
-        return
+<b>1. ⚔️ Дуэль абзацев</b>
+• Напиши текст на заданную тему
+• 15 минут на написание
+• 10 минут голосование
+• Приз: 25 кавычек
 
-    # Профиль - чистый UI в теме, чтобы не засорять
-    if data in ("menu_profile", "m:profile"):
-        show_profile(user_id, chat_id=chat_id, topic_id=topic_id, as_clean_ui=True)
-        answer_callback(cb_id, "Профиль показан", show_alert=False)
-        return
+<b>2. 🎲 Правда или выдумка</b>
+• Угадай ложный факт
+• 10 минут на обсуждение
+• Приз: 10 кавычек
 
-    # Основное меню
-    if data == "menu_rules":
-        show_rules(chat_id)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
+<b>3. 🎡 Колесо тем</b>
+• Напиши текст на случайную тему
+• 30 минут на написание
+• Приз: 15 кавычек
 
-    if data == "menu_queue" or data == "m:queue":
-        show_queue(chat_id, topic_id=topic_id)
-        answer_callback(cb_id, "Очередь показана", show_alert=False)
-        return
-
-    if data == "menu_top":
-        show_top(chat_id, topic_id=topic_id)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "menu_games":
-        send_clean_ui(chat_id, user_id, "🎮 Игры находятся в теме “Игры дня”. Там же есть меню сверху.", topic_id=topic_id, ttl_seconds=40)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "menu_shop" or data == "m:shop_show":
-        # покажем витрину как clean ui
-        send_clean_ui(chat_id, user_id, shop_list_text(), topic_id=topic_id, reply_markup=shop_list_keyboard(), ttl_seconds=120)
-        answer_callback(cb_id, "Витрина показана", show_alert=False)
-        return
-
-    if data == "menu_submit" or data == "m:submit_hint":
-        # подсказка, что submit только в личке
-        send_clean_ui(chat_id, user_id, "✍️ Подача статьи работает только в личке с ботом. Напиши мне /start и потом /submit.", topic_id=topic_id, ttl_seconds=60)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    # Меню тем
-    if data == "m:rules_short":
-        send_clean_ui(chat_id, user_id, "📜 Кратко: очередь, лист чтения, фидбек по делу, ссылки только VK/Дзен/Telegram.", topic_id=topic_id, ttl_seconds=60)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "m:how_it_works":
-        text = (
-            "🧭 <b>Как тут все устроено</b>\n\n"
-            "1) Очередь: подаешь 1 ссылку раз в 48-72 часа.\n"
-            "2) В 19:00 МСК выходит лист чтения на 5-10 ссылок.\n"
-            "3) Читаем лист, пишем фидбек, получаем кавычки 🪙.\n"
-            "4) Игры и дуэли для разрядки.\n"
-        )
-        send_clean_ui(chat_id, user_id, text, topic_id=topic_id, ttl_seconds=120)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "m:reading_today":
-        send_clean_ui(chat_id, user_id, "Лист чтения публикуется в 19:00 МСК в теме “Лист чтения дня”.", topic_id=topic_id, ttl_seconds=60)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "m:submit_remind":
-        send_clean_ui(chat_id, user_id, "Напоминания о возможности подать ссылку приходят в личку. Для этого нужен /start в личке.", topic_id=topic_id, ttl_seconds=80)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "m:feedback_how":
-        send_clean_ui(
-            chat_id, user_id,
-            "💬 Фидбек по-человечески:\n"
-            "- Что понравилось\n"
-            "- Что можно улучшить\n"
-            "- Самая сильная деталь\n"
-            "- Один совет автору\n\n"
-            "“норм” не фидбек 🙂",
-            topic_id=topic_id, ttl_seconds=120
-        )
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "m:feedback_reward":
-        send_clean_ui(chat_id, user_id, "🎁 За качественный фидбек можно давать кавычки. Это клуб, а не суд, но поощрения будут.", topic_id=topic_id, ttl_seconds=90)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "m:duel_start":
-        # старт дуэли текстом-командой: пусть будет доступно любому
-        start_paragraph_duel(user_id)
-        answer_callback(cb_id, "Дуэль создана", show_alert=False)
-        return
-
-    if data == "m:duel_how":
-        send_clean_ui(chat_id, user_id, "⚔️ Участие: отвечаешь на сообщение дуэли своим абзацем. Потом голосование.", topic_id=topic_id, ttl_seconds=80)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    # Dice stake picker
-    if data == "m:dice":
-        send_clean_ui(chat_id, user_id, "🎲 Выбери ставку:", topic_id=topic_id, reply_markup=dice_stake_picker_keyboard(), ttl_seconds=60)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data.startswith("dice:new:"):
-        if not is_user_registered(user_id):
-            answer_callback(cb_id, "Сначала /start в личке с ботом.", show_alert=True)
-            return
-        try:
-            stake = int(data.split(":")[-1])
-        except Exception:
-            answer_callback(cb_id, "Ставка не распознана.", show_alert=True)
-            return
-
-        gid, msg2 = start_dice_challenge(user_id, stake)
-        if gid:
-            answer_callback(cb_id, "Игра создана в теме “Игры дня”.", show_alert=False)
-        else:
-            answer_callback(cb_id, msg2, show_alert=True)
-        return
-
-    if data.startswith("dice:join:"):
-        gid = data.split(":", 2)[2]
-        ok, msg2 = accept_dice_challenge(gid, user_id)
-        answer_callback(cb_id, msg2, show_alert=not ok)
-        return
-
-    if data.startswith("dice:cancel:"):
-        gid = data.split(":", 2)[2]
-        ok, msg2 = cancel_dice_game(gid, user_id)
-        answer_callback(cb_id, msg2, show_alert=not ok)
-        return
-
-    # Shop buy
-    if data.startswith("shop:buy:"):
-        if not is_user_registered(user_id):
-            answer_callback(cb_id, "Сначала /start в личке.", show_alert=True)
-            return
-        item_id = data.split(":", 2)[2]
-        ok, msg2 = shop_buy(user_id, item_id)
-        answer_callback(cb_id, msg2, show_alert=not ok)
-        return
-
-    if data == "m:shop_buy":
-        send_clean_ui(chat_id, user_id, "Выбери товар в витрине и нажми “Купить”.", topic_id=topic_id, ttl_seconds=60)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "m:joke":
-        jokes = [
-            "Писатель хотел вдохновения. Нашел дедлайн.",
-            "Очередь спасает нервы. Особенно чужие.",
-            "Фидбек уровня “норм” это как чай без чая. Вроде что-то, но нет.",
+<b>Команды:</b>
+/game - это меню
+/duel - начать дуэль (в группе)"""
+    
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "⚔️ Начать дуэль", "callback_data": "start_duel"}],
+            [{"text": "🎲 Правда или выдумка", "callback_data": "truth_game"}],
+            [{"text": "🎡 Колесо тем", "callback_data": "wheel_game"}]
         ]
-        send_clean_ui(chat_id, user_id, "😄 " + jokes[int(time.time()) % len(jokes)], topic_id=topic_id, ttl_seconds=60)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
+    }
+    
+    send_telegram_message(chat_id, text, reply_markup=keyboard)
 
-    if data == "m:truth":
-        send_clean_ui(chat_id, user_id, "🤥 “Правда или выдумка” запускается по расписанию. Скоро будет отдельная кнопка “старт по запросу”.", topic_id=topic_id, ttl_seconds=80)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "m:wheel":
-        send_clean_ui(chat_id, user_id, "🎡 “Колесо тем” запускается по расписанию. Будет и ручной запуск.", topic_id=topic_id, ttl_seconds=80)
-        answer_callback(cb_id, "Ок", show_alert=False)
-        return
-
-    if data == "m:games_results":
-        update_games_pin()
-        answer_callback(cb_id, "Обновил закреп с результатами", show_alert=False)
-        return
-
-    answer_callback(cb_id, "Кнопка нажата. Толку пока мало, но это временно 🙂", show_alert=False)
-
-# =========================
-# DUELS (абзацы) - минимально, как у тебя было
-# =========================
-
-def start_paragraph_duel(initiator_id: int, topic=None):
-    initiator_id = int(initiator_id)
-    if not topic:
-        topics = [
-            "Утро после конца света",
-            "Разговор с зеркалом",
-            "Письмо из прошлого",
-            "Тайна старой библиотеки",
-            "Последний день лета"
-        ]
-        topic = topics[int(time.time()) % len(topics)]
-
+def start_paragraph_duel(initiator_id: int):
+    """Начать дуэль абзацев"""
+    topics = [
+        "Утро после конца света",
+        "Разговор с зеркалом", 
+        "Письмо из прошлого",
+        "Тайна старой библиотеки",
+        "Последний день лета"
+    ]
+    topic = random.choice(topics)
+    
     duel_id = f"duel_{len(duels)}_{int(time.time())}"
+    
     duel = {
         "id": duel_id,
         "topic": topic,
         "initiator": initiator_id,
-        "participants": [initiator_id],
+        "participants": [],
         "paragraphs": {},
         "status": "waiting",
         "created_at": datetime.now().isoformat(),
         "votes": {},
         "winner": None,
-        "prize": 25,
-        "message_id": None,
+        "prize": 25
     }
+    
     duels.append(duel)
+    
+    text = f"""⚔️ <b>Дуэль абзацев началась!</b>
 
-    text = (
-        "⚔️ <b>Дуэль абзацев</b>\n\n"
-        f"Тема: <b>{html_escape(topic)}</b>\n"
-        f"Инициатор: {html_escape(safe_username(initiator_id))}\n"
-        "Правила:\n"
-        "- 3-5 предложений\n"
-        "- 15 минут на сдачу\n"
-        "- потом голосование\n\n"
-        "Чтобы участвовать, ответь на это сообщение своим абзацем."
-    )
+<b>Тема:</b> {topic}
+<b>Инициатор:</b> {safe_username(initiator_id)}
+<b>Приз:</b> 25 кавычек 🪙
 
-    res = send_telegram_message(GROUP_ID, text, topic_id=GROUP_TOPICS["duels"])
-    if res and res.get("ok") and res.get("result", {}).get("message_id"):
-        duel["message_id"] = res["result"]["message_id"]
+<b>Правила:</b>
+1. Напиши 3-5 предложений на тему
+2. Время: 15 минут
+3. Отправь свой текст ответом на это сообщение
+4. После будет голосование (10 минут)
 
-    # таймер завершения приема
-    threading.Timer(900, finish_duel, args=[duel_id]).start()
+Участвуй и побеждай! ✍️"""
+    
+    send_telegram_message(GROUP_ID, text)
+    
+    # Таймер для завершения приема текстов
+    threading.Timer(900, finish_duel_submissions, args=[duel_id]).start()
+    
     return duel_id
 
-def finish_duel(duel_id: str):
-    duel = next((d for d in duels if d["id"] == duel_id), None)
-    if not duel or duel["status"] != "waiting":
+def finish_duel_submissions(duel_id: str):
+    """Завершить прием текстов в дуэли"""
+    duel = next((d for d in duels if d["id"] == duel_id and d["status"] == "waiting"), None)
+    if not duel:
         return
-    duel["status"] = "voting"
-
+    
     if len(duel["paragraphs"]) < 2:
+        send_telegram_message(GROUP_ID, "⚔️ Дуэль отменена: недостаточно участников 😔")
         duel["status"] = "cancelled"
-        send_telegram_message(GROUP_ID, "⚔️ Дуэль отменена: мало участников. Это не позор, это статистика.", topic_id=GROUP_TOPICS["duels"])
         return
+    
+    duel["status"] = "voting"
+    
+    # Показываем тексты для голосования
+    text = f"""🗳 <b>Голосование в дуэли</b>
 
-    # простое голосование: ответ числом
-    text = (
-        "🗳 <b>Голосование в дуэли</b>\n\n"
-        f"Тема: {html_escape(duel['topic'])}\n\n"
-    )
+<b>Тема:</b> {duel['topic']}
+<b>Участников:</b> {len(duel['paragraphs'])}
+
+"""
+    
     participants = list(duel["paragraphs"].items())
-    for i, (uid, para) in enumerate(participants, 1):
-        text += f"\n<b>#{i}</b> ({html_escape(safe_username(uid))}):\n{html_escape(para[:220])}...\n"
+    for i, (user_id, paragraph) in enumerate(participants, 1):
+        username = safe_username(user_id)
+        text += f"\n<b>#{i} - {username}</b>\n{html_escape(paragraph[:150])}...\n"
+    
+    text += "\n<b>Голосование:</b> ответь числом (1, 2, 3...) на это сообщение\n<b>Время:</b> 10 минут"
+    
+    send_telegram_message(GROUP_ID, text)
+    
+    # Таймер для завершения голосования
+    threading.Timer(600, finish_duel_voting, args=[duel_id]).start()
 
-    text += "\nОтветь числом (1, 2, 3...). Время: 10 минут."
-    send_telegram_message(GROUP_ID, text, topic_id=GROUP_TOPICS["duels"])
-    threading.Timer(600, count_duel_votes, args=[duel_id]).start()
-
-def count_duel_votes(duel_id: str):
-    duel = next((d for d in duels if d["id"] == duel_id), None)
-    if not duel or duel["status"] != "voting":
+def finish_duel_voting(duel_id: str):
+    """Завершить голосование в дуэли"""
+    duel = next((d for d in duels if d["id"] == duel_id and d["status"] == "voting"), None)
+    if not duel:
         return
-
+    
+    # Подсчет голосов
     votes_count = defaultdict(int)
-    for _, vote in duel.get("votes", {}).items():
-        votes_count[int(vote)] += 1
-
+    for vote in duel["votes"].values():
+        votes_count[vote] += 1
+    
     if not votes_count:
+        send_telegram_message(GROUP_ID, "⚔️ Дуэль завершена: никто не проголосовал 😔")
         duel["status"] = "finished"
-        send_telegram_message(GROUP_ID, "🗳 Голосов нет. Дуэль ушла в небытие.", topic_id=GROUP_TOPICS["duels"])
         return
-
+    
+    # Определяем победителя
     winner_index = max(votes_count.items(), key=lambda x: x[1])[0]
     participants = list(duel["paragraphs"].keys())
-    if not (1 <= winner_index <= len(participants)):
-        duel["status"] = "finished"
-        return
+    
+    if 1 <= winner_index <= len(participants):
+        winner_id = participants[winner_index - 1]
+        duel["winner"] = winner_id
+        
+        # Награждаем победителя
+        add_quotes(winner_id, duel["prize"], "Победа в дуэли")
+        if winner_id in users:
+            users[winner_id]["games_played"] = users[winner_id].get("games_played", 0) + 1
+        
+        send_telegram_message(
+            GROUP_ID,
+            f"""🏆 <b>Дуэль завершена!</b>
 
-    winner_id = participants[winner_index - 1]
-    duel["winner"] = winner_id
+<b>Победитель:</b> {safe_username(winner_id)}
+<b>Тема:</b> {duel['topic']}
+<b>Приз:</b> {duel['prize']} кавычек 🪙
+
+Поздравляем победителя! 🎉"""
+        )
+    
     duel["status"] = "finished"
-    add_quotes(winner_id, duel["prize"], "Победа в дуэли")
-    if winner_id in users:
-        users[winner_id]["duels_won"] = users[winner_id].get("duels_won", 0) + 1
-
-    send_telegram_message(
-        GROUP_ID,
-        f"🏆 <b>Дуэль завершена</b>\n\nПобедитель: {html_escape(safe_username(winner_id))}\nПриз: {duel['prize']} 🪙",
-        topic_id=GROUP_TOPICS["duels"]
-    )
+    games_history.append({
+        "type": "duel",
+        "topic": duel["topic"],
+        "winner": duel["winner"],
+        "date": datetime.now().isoformat()
+    })
 
 # =========================
-# MESSAGE HANDLER
+# ОБРАБОТКА СООБЩЕНИЙ
 # =========================
-
-def handle_text_button(chat_id, user_id, text, thread_id=None):
-    # Обработка reply-клавиатуры в личке
-    t = (text or "").strip()
-    if t == "📜 Правила":
-        show_rules(user_id)
-        return True
-    if t == "📋 Очередь":
-        show_queue(user_id)
-        return True
-    if t == "👤 Профиль":
-        show_profile(user_id)
-        return True
-    if t == "💰 Баланс":
-        send_telegram_message(user_id, f"Баланс: {user_balances.get(int(user_id),0)} 🪙")
-        return True
-    if t == "🎮 Игры":
-        send_telegram_message(user_id, "Игры проходят в группе в теме “Игры дня”.")
-        return True
-    if t == "🛒 Магазин":
-        send_telegram_message(user_id, shop_list_text(), reply_markup=shop_list_keyboard())
-        return True
-    if t == "✍️ Подать статью":
-        start_article_submission(user_id)
-        return True
-    if t == "🏆 Топ":
-        show_top(user_id)
-        return True
-    return False
 
 def process_message(message: dict):
+    """Обработка входящего сообщения"""
     chat_id = message["chat"]["id"]
     user_id = int(message["from"]["id"])
     text = message.get("text", "") or ""
-    thread_id = message.get("message_thread_id")
-
-    # activity
+    
+    # Обновляем активность
     if user_id in users:
         users[user_id]["last_active"] = datetime.now().isoformat()
-
-    # Ответ на сообщение (для дуэлей/игр) - тут минимально: дуэль абзацев
-    if "reply_to_message" in message:
+    
+    # Проверяем, является ли это ответом на сообщение в дуэли
+    if "reply_to_message" in message and chat_id == int(GROUP_ID):
         reply_to = message["reply_to_message"]
-        # дуэль: ответ на стартовое сообщение
-        for duel in duels:
-            if duel.get("message_id") == reply_to.get("message_id") and duel.get("status") == "waiting":
-                duel["participants"] = list(set(duel.get("participants", []) + [user_id]))
-                duel["paragraphs"][user_id] = text
-                send_telegram_message(user_id, "✅ Абзац принят. Жди голосование.", disable_web_page_preview=True)
-                # можно чистить в теме лишнее: оставим, потому что это контент дуэли
-                return
-
-        # голосование в дуэли: если человек ответил числом в теме дуэлей
-        if thread_id == GROUP_TOPICS["duels"]:
-            m = re.match(r"^\s*(\d{1,2})\s*$", text)
-            if m:
-                vote = int(m.group(1))
-                # найдём последнюю дуэль в статусе voting
-                active = next((d for d in reversed(duels) if d.get("status") == "voting"), None)
-                if active:
-                    active.setdefault("votes", {})[user_id] = vote
-                    # не шумим в чате: подтвердим в личке
-                    send_telegram_message(user_id, "🗳 Голос принят. Спасибо за честность. Или хотя бы за попытку.")
-                return
-
-    # Если пользователь в личке и в состоянии подачи статьи
-    if chat_id == user_id:
-        st = user_states.get(user_id, {})
-        if st.get("state") == "await_article" and not text.startswith("/"):
-            title, desc, link = parse_submission_text(text)
-            if not title or not desc or not link:
-                send_telegram_message(user_id, "Не вижу все три блока: ЗАГОЛОВОК, ОПИСАНИЕ, ССЫЛКА. Попробуй еще раз.")
-                return
-            if not is_allowed_article_url(link):
-                send_telegram_message(user_id, f"Ссылка должна быть на {ALLOWED_PLATFORMS_TEXT} и начинаться с https://")
-                return
-            ok, msg2 = can_submit_article(user_id)
-            if not ok:
-                send_telegram_message(user_id, msg2)
-                return
-            aid = add_article_to_queue(user_id, title, desc, link)
-            user_states.pop(user_id, None)
-            send_telegram_message(user_id, f"✅ Принято в очередь: <b>{html_escape(title)}</b>\nID: {aid}\n\nЖди лист чтения в 19:00 МСК 🙂")
+        reply_text = reply_to.get("text", "")
+        
+        # Ответ в дуэли (текст)
+        if "⚔️ Дуэль абзацев началась!" in reply_text or "🗳 Голосование в дуэли" in reply_text:
+            handle_duel_response(user_id, text, reply_text)
             return
-
-        # Reply keyboard buttons
-        if handle_text_button(chat_id, user_id, text):
+        
+        # Голосование в дуэли (число)
+        if "Голосование:" in reply_text:
+            try:
+                vote = int(text.strip())
+                handle_duel_vote(user_id, vote)
+            except ValueError:
+                pass
             return
-
-    # Команды
+    
+    # Обработка команд
     if text.startswith("/"):
         command = normalize_command(text)
-
-        # авто-регистрация: /start в любом месте
+        
+        # Регистрация
         if command == "/start":
             user_data = {
                 "id": user_id,
@@ -1538,167 +738,421 @@ def process_message(message: dict):
                 "last_name": message["from"].get("last_name", "")
             }
             register_user(user_data)
-
-            # в группе скажем коротко, а подробности уйдут в личку
-            if is_group_chat(chat_id):
-                send_telegram_message(chat_id, "✅ Ок. Я написал тебе в личку. Проверь сообщения с ботом.", topic_id=thread_id)
-            else:
-                send_telegram_message(chat_id, "✅ Ты зарегистрирован. Пользуйся кнопками снизу или /help.")
             return
-
+        
+        # Проверка регистрации для остальных команд
+        if not is_user_registered(user_id) and command not in ["/start", "/help"]:
+            send_telegram_message(chat_id, "⚠️ Сначала зарегистрируйся через /start")
+            return
+        
+        # Личные команды (работают везде)
         if command == "/help":
             show_help(chat_id)
             return
-
-        # остальные команды требуют регистрации
-        if not is_user_registered(user_id) and command not in ("/start", "/help"):
-            send_telegram_message(chat_id, "Сначала зарегистрируйся: /start (лучше в личке с ботом).", topic_id=thread_id)
-            return
-
-        if command == "/rules":
-            show_rules(chat_id)
-            return
-
-        if command == "/queue":
-            show_queue(chat_id, topic_id=thread_id)
-            return
-
-        if command == "/top":
-            show_top(chat_id, topic_id=thread_id)
-            return
-
+        
         if command == "/profile":
-            # в группе лучше чистым UI
-            show_profile(user_id, chat_id=chat_id, topic_id=thread_id, as_clean_ui=is_group_chat(chat_id))
+            show_profile(user_id, chat_id)
             return
-
+        
         if command == "/balance":
-            # в личке сообщением, в группе пусть будет в личку
-            if chat_id == user_id:
-                send_telegram_message(user_id, f"Баланс: {user_balances.get(user_id,0)} 🪙")
-            else:
-                send_telegram_message(user_id, f"Баланс: {user_balances.get(user_id,0)} 🪙")
-                send_telegram_message(chat_id, "💰 Баланс отправил в личку.", topic_id=thread_id)
+            balance = user_balances.get(user_id, 0)
+            send_telegram_message(chat_id, f"💰 <b>Твой баланс:</b> {balance} кавычек 🪙")
             return
-
+        
         if command == "/daily":
             give_daily_reward(user_id)
             return
-
+        
         if command == "/submit":
-            if chat_id != user_id:
-                send_telegram_message(chat_id, "✍️ Подача статьи только в личке с ботом.", topic_id=thread_id)
-            else:
+            if chat_id == user_id:  # Только в личных сообщениях
                 start_article_submission(user_id)
+            else:
+                send_telegram_message(chat_id, "✍️ Подача статьи доступна только в личных сообщениях с ботом")
             return
-
+        
+        if command == "/rules":
+            show_rules(chat_id)
+            return
+        
+        # Групповые команды (работают в группе)
+        if command == "/queue":
+            if chat_id == int(GROUP_ID) or chat_id == user_id:
+                show_queue(chat_id)
+            else:
+                send_telegram_message(chat_id, "📋 Очередь можно посмотреть в группе или в личных сообщениях")
+            return
+        
+        if command == "/top":
+            if chat_id == int(GROUP_ID) or chat_id == user_id:
+                show_top(chat_id)
+            else:
+                send_telegram_message(chat_id, "🏆 Топ можно посмотреть в группе или в личных сообщениях")
+            return
+        
+        if command == "/game":
+            if chat_id == int(GROUP_ID) or chat_id == user_id:
+                show_games_menu(chat_id)
+            else:
+                send_telegram_message(chat_id, "🎮 Игры доступны в группе")
+            return
+        
+        if command == "/duel":
+            if chat_id == int(GROUP_ID):
+                start_paragraph_duel(user_id)
+            else:
+                send_telegram_message(chat_id, "⚔️ Дуэли доступны только в группе")
+            return
+        
+        # Админ команды
         if command == "/publish_reading_list" and user_id in ADMIN_IDS:
-            res = publish_daily_reading_list()
-            send_telegram_message(user_id, res)
+            publish_reading_list()
             return
-
-        if command == "/pin_menus" and user_id in ADMIN_IDS:
-            ensure_all_topic_menus()
-            send_telegram_message(user_id, "✅ Меню в темах обновлены и закреплены.")
+        
+        if command == "/admin_stats" and user_id in ADMIN_IDS:
+            show_admin_stats(user_id)
             return
-
-        send_telegram_message(chat_id, "Неизвестная команда. /help", topic_id=thread_id)
+        
+        # Неизвестная команда
+        send_telegram_message(chat_id, "🤔 Неизвестная команда. Напиши /help для списка команд")
         return
+    
+    # Обработка подачи статьи (только в личных сообщениях)
+    if chat_id == user_id and user_id in user_states:
+        state = user_states[user_id].get("state")
+        
+        if state == "awaiting_article":
+            title, description, url = parse_submission_text(text)
+            
+            if not title or not description or not url:
+                send_telegram_message(user_id, "❌ Не вижу все три блока: ЗАГОЛОВОК, ОПИСАНИЕ, ССЫЛКА\n\nПопробуй еще раз:")
+                return
+            
+            if not is_allowed_article_url(url):
+                send_telegram_message(
+                    user_id, 
+                    f"❌ Ссылка недопустима\n\nПринимаем только: {ALLOWED_PLATFORMS_TEXT}\n\nУбедись, что ссылка начинается с https:// и ведет на разрешенный сайт"
+                )
+                return
+            
+            can_submit, message = can_submit_article(user_id)
+            if not can_submit:
+                send_telegram_message(user_id, message)
+                del user_states[user_id]
+                return
+            
+            # Добавляем статью в очередь
+            article_id = add_article_to_queue(user_id, title, description, url)
+            
+            # Уведомление в группу
+            group_notification = f"""📝 <b>Новая статья в очереди!</b>
 
-    # Не команды
+<b>Заголовок:</b> {html_escape(title)}
+<b>Автор:</b> {safe_username(user_id)}
+
+Очередь: /queue"""
+            send_telegram_message(GROUP_ID, group_notification)
+            
+            # Подтверждение автору
+            send_telegram_message(
+                user_id,
+                f"""✅ <b>Статья добавлена в очередь!</b>
+
+<b>Заголовок:</b> {html_escape(title)}
+<b>ID:</b> {article_id}
+<b>Позиция в очереди:</b> {len(articles_queue)}
+
+Жди публикации в листе чтения (19:00 МСК) 🕔"""
+            )
+            
+            del user_states[user_id]
+            return
+    
+    # Если не команда и не состояние, показываем помощь
     if chat_id == user_id:
-        send_telegram_message(user_id, "Напиши /help или жми кнопки снизу.")
+        send_telegram_message(user_id, "Напиши /help для списка команд или /submit чтобы подать статью ✍️")
+
+def handle_duel_response(user_id: int, text: str, reply_text: str):
+    """Обработка ответа в дуэли"""
+    # Находим активную дуэль
+    active_duel = None
+    for duel in duels:
+        if duel["status"] == "waiting":
+            active_duel = duel
+            break
+    
+    if not active_duel:
         return
+    
+    # Проверяем, не участвовал ли уже
+    if user_id in active_duel["paragraphs"]:
+        send_telegram_message(user_id, "⚠️ Ты уже отправил текст для этой дуэли")
+        return
+    
+    # Сохраняем текст
+    active_duel["paragraphs"][user_id] = text
+    active_duel["participants"].append(user_id)
+    
+    send_telegram_message(user_id, "✅ Твой текст принят! Жди начала голосования 🤞")
+    
+    # Уведомление в группу
+    if len(active_duel["paragraphs"]) == 1:
+        send_telegram_message(GROUP_ID, f"🎯 Первый участник дуэли: {safe_username(user_id)}! Еще есть время присоединиться ⏳")
+
+def handle_duel_vote(user_id: int, vote: int):
+    """Обработка голоса в дуэли"""
+    # Находим дуэль в стадии голосования
+    voting_duel = None
+    for duel in duels:
+        if duel["status"] == "voting":
+            voting_duel = duel
+            break
+    
+    if not voting_duel:
+        return
+    
+    # Проверяем, не голосовал ли уже
+    if user_id in voting_duel["votes"]:
+        send_telegram_message(user_id, "⚠️ Ты уже проголосовал в этой дуэли")
+        return
+    
+    # Проверяем корректность голоса
+    participants_count = len(voting_duel["paragraphs"])
+    if 1 <= vote <= participants_count:
+        voting_duel["votes"][user_id] = vote
+        send_telegram_message(user_id, "✅ Твой голос учтен! Спасибо за участие 🤝")
 
 # =========================
-# WEBHOOK
+# CALLBACK ОБРАБОТЧИК
+# =========================
+
+def handle_callback(callback: dict):
+    """Обработка callback запросов"""
+    callback_id = callback["id"]
+    user_id = int(callback["from"]["id"])
+    data = callback.get("data", "")
+    
+    # Обновляем активность
+    if user_id in users:
+        users[user_id]["last_active"] = datetime.now().isoformat()
+    
+    if data == "start_duel":
+        if is_user_registered(user_id):
+            start_paragraph_duel(user_id)
+            answer_callback(callback_id, "Дуэль началась! Смотри в группе ⚔️")
+        else:
+            answer_callback(callback_id, "Сначала зарегистрируйся через /start", show_alert=True)
+    
+    elif data == "truth_game":
+        answer_callback(callback_id, "Игра 'Правда или выдумка' скоро будет доступна! 🎲")
+    
+    elif data == "wheel_game":
+        answer_callback(callback_id, "Игра 'Колесо тем' скоро будет доступна! 🎡")
+    
+    else:
+        answer_callback(callback_id, "Кнопка пока не работает. Скоро добавим функционал! 🚧")
+
+# =========================
+# АДМИН ФУНКЦИИ
+# =========================
+
+def publish_reading_list():
+    """Опубликовать лист чтения (админ)"""
+    if not articles_queue:
+        send_telegram_message(GROUP_ID, "📭 <b>Лист чтения</b>\n\nОчередь пустая. Нечего публиковать 😔")
+        return
+    
+    # Берем до 5 статей из очереди
+    articles_to_publish = []
+    while len(articles_to_publish) < 5 and articles_queue:
+        article = articles_queue.popleft()
+        articles_to_publish.append(article)
+        published_articles.append(article)
+    
+    # Формируем лист чтения
+    lines = [f"📚 <b>Лист чтения на {datetime.now().strftime('%d.%m.%Y')}</b>\n"]
+    
+    for i, article in enumerate(articles_to_publish, 1):
+        author = safe_username(article["user_id"])
+        title = html_escape(article["title"])
+        description = html_escape(article["description"][:200])
+        url = article["url"]
+        
+        lines.append(f"""
+<b>{i}. {title}</b>
+👤 <i>Автор: {author}</i>
+📝 {description}...
+🔗 <a href="{url}">Читать статью</a>
+""")
+    
+    lines.append("""
+<b>🎯 Задание на сегодня:</b>
+1. Прочитай минимум 1 статью
+2. Оставь конструктивный фидбек
+3. Получи кавычки за активность
+
+<b>⏰ Фидбек принимаем до 23:59 МСК</b>""")
+    
+    text = "\n".join(lines)
+    send_telegram_message(GROUP_ID, text)
+    
+    # Награждаем авторов
+    for article in articles_to_publish:
+        user_id = article["user_id"]
+        add_quotes(user_id, 15, "Статья опубликована в листе чтения")
+        send_telegram_message(user_id, f"🎉 Твоя статья '{html_escape(article['title'][:50])}...' опубликована в листе чтения! +15 кавычек 🪙")
+    
+    return f"Опубликовано {len(articles_to_publish)} статей"
+
+def show_admin_stats(user_id: int):
+    """Показать статистику админу"""
+    stats = {
+        "users": len(users),
+        "articles_in_queue": len(articles_queue),
+        "articles_published_today": len(published_articles),
+        "total_quotes": sum(user_balances.values()),
+        "active_duels": len([d for d in duels if d["status"] in ["waiting", "voting"]]),
+        "last_hour_active": len([u for u in users.values() 
+                                 if (datetime.now() - datetime.fromisoformat(u["last_active"])).seconds < 3600])
+    }
+    
+    text = f"""📊 <b>Статистика системы</b>
+
+<b>Пользователи:</b> {stats['users']}
+<b>Активных за час:</b> {stats['last_hour_active']}
+<b>Статей в очереди:</b> {stats['articles_in_queue']}/10
+<b>Опубликовано сегодня:</b> {stats['articles_published_today']}
+<b>Всего кавычек в системе:</b> {stats['total_quotes']} 🪙
+<b>Активных дуэлей:</b> {stats['active_duels']}
+
+<b>Админ команды:</b>
+/publish_reading_list - опубликовать лист чтения"""
+    
+    send_telegram_message(user_id, text)
+
+# =========================
+# WEBHOOK И МАРШРУТЫ FLASK
 # =========================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    """Обработка вебхука от Telegram"""
     try:
         data = request.get_json(force=True, silent=True) or {}
-        logger.info("📨 Webhook keys: %s", list(data.keys()))
-
+        
+        # Логируем тип обновления
+        update_keys = list(data.keys())
+        logger.info(f"📨 Получен вебхук: {update_keys}")
+        
+        # Обработка сообщения
         if "message" in data:
             process_message(data["message"])
+        
+        # Обработка callback запросов
         elif "callback_query" in data:
             handle_callback(data["callback_query"])
-
+        
         return jsonify({"status": "ok"}), 200
+    
     except Exception as e:
-        logger.error("Webhook error: %s", e, exc_info=True)
+        logger.error(f"❌ Ошибка в webhook: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
-@app.route("/health")
+@app.route("/health", methods=["GET"])
 def health():
+    """Health check для Render"""
     return jsonify({
         "status": "healthy",
-        "ts": datetime.now().isoformat(),
+        "timestamp": datetime.now().isoformat(),
         "users": len(users),
         "queue": len(articles_queue),
-        "published_today": len(published_articles),
-        "total_quotes": sum(int(v) for v in user_balances.values()),
+        "version": "2.0"
     }), 200
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def home():
-    return "OK", 200
+    """Главная страница"""
+    return """
+    <h1>🤖 Бот для клуба "Увлекательные чтения"</h1>
+    <p>Статус: <strong>Работает ✅</strong></p>
+    <p>Пользователей: {}</p>
+    <p>Статей в очереди: {}</p>
+    <p><a href="/health">Проверка здоровья</a></p>
+    """.format(len(users), len(articles_queue))
 
 # =========================
-# АВТОЗАДАЧИ
+# АВТОМАТИЧЕСКИЕ ЗАДАЧИ
 # =========================
-
-def schedule_submit_notifications(interval_seconds=60):
-    def loop():
-        while True:
-            time.sleep(interval_seconds)
-            now = datetime.now()
-            for uid, last in list(user_last_submit.items()):
-                if not isinstance(last, datetime):
-                    continue
-                ready_at = last + timedelta(hours=48)
-                if now >= ready_at:
-                    last_not = user_submit_notified.get(uid, "") or ""
-                    # уведомляем один раз на каждую подачу
-                    if not last_not:
-                        send_telegram_message(uid, "🔔 Можно снова подать статью. /submit в личке 🙂")
-                        user_submit_notified[uid] = datetime.now().isoformat()
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
 
 def schedule_daily_tasks():
-    def loop():
-        # Раз в час обновим закрепленные меню, чтобы не терялись после переездов/удалений
-        last_menu_refresh = 0
+    """Планировщик ежедневных задач"""
+    def task_loop():
         while True:
             now = datetime.now()
+            
+            # Публикация листа чтения в 19:00 МСК (16:00 UTC)
+            if now.hour == 16 and now.minute == 0:
+                if articles_queue:
+                    publish_reading_list()
+            
+            # Ежедневный сброс счетчиков в 00:00 МСК (21:00 UTC предыдущего дня)
+            if now.hour == 21 and now.minute == 0:
+                published_articles.clear()
+                logger.info("📅 Ежедневный сброс: очищен список опубликованных статей")
+            
+            time.sleep(60)  # Проверка каждую минуту
+    
+    thread = threading.Thread(target=task_loop, daemon=True)
+    thread.start()
 
-            if time.time() - last_menu_refresh > 3600:
-                ensure_all_topic_menus()
-                last_menu_refresh = time.time()
-
-            # 19:00 МСК лист чтения: тут без таймзоны, используй время сервера.
-            # На Render обычно UTC. Если хочешь строго МСК, лучше перевести через pytz.
-            # Пока оставим как есть, потому что стабильность важнее мечты.
-            if now.hour == 19 and now.minute == 0:
-                publish_daily_reading_list()
-
-            time.sleep(60)
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
+def schedule_submit_reminders():
+    """Напоминания о возможности подать статью"""
+    def reminder_loop():
+        while True:
+            now = datetime.now()
+            
+            for user_id, last_submit in list(user_last_submit.items()):
+                if not isinstance(last_submit, datetime):
+                    continue
+                
+                # Проверяем, прошло ли 48 часов
+                hours_passed = (now - last_submit).total_seconds() / 3600
+                if hours_passed >= 48:
+                    # Проверяем, не уведомляли ли уже
+                    last_notified = user_submit_notified.get(user_id)
+                    if not last_notified or (now - last_notified).total_seconds() > 3600:
+                        if user_id in users:
+                            send_telegram_message(
+                                user_id,
+                                "🔔 <b>Можно подать новую статью!</b>\n\nПрошло более 48 часов с последней подачи. Используй /submit ✍️"
+                            )
+                            user_submit_notified[user_id] = now
+            
+            time.sleep(300)  # Проверка каждые 5 минут
+    
+    thread = threading.Thread(target=reminder_loop, daemon=True)
+    thread.start()
 
 # =========================
-# INIT (важно для gunicorn)
+# ИНИЦИАЛИЗАЦИЯ
 # =========================
 
 def init():
-    load_data()
-    schedule_data_saves()
-    schedule_submit_notifications()
+    """Инициализация приложения"""
+    logger.info("🚀 Инициализация бота...")
+    
+    # Запуск фоновых задач
     schedule_daily_tasks()
-    ensure_all_topic_menus()
-    atexit.register(save_data)
-    logger.info("🚀 Init done. Users=%d Queue=%d", len(users), len(articles_queue))
+    schedule_submit_reminders()
+    
+    logger.info(f"✅ Бот инициализирован. Пользователей: {len(users)}, Очередь: {len(articles_queue)}")
 
+# Запуск инициализации при импорте
 init()
+
+# =========================
+# ЗАПУСК СЕРВЕРА
+# =========================
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
