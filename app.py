@@ -71,7 +71,7 @@ def send_telegram_message(chat_id, text, reply_to_message_id=None, topic_id=None
     if reply_to_message_id:
         payload['reply_to_message_id'] = reply_to_message_id
     
-    if topic_id and (chat_id == GROUP_ID or str(chat_id).startswith('@')):
+    if topic_id and (chat_id == GROUP_ID or str(chat_id).startswith('@') or (isinstance(chat_id, int) and chat_id < 0)):
         payload['message_thread_id'] = topic_id
     
     try:
