@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 import threading
 import time
 import re
+import atexit
 
 # ============ НАСТРОЙКА ============
 
@@ -57,10 +58,22 @@ games_history = []  # История игр
 duels = []  # Активные дуэли
 games_results = []  # Результаты игр для закрепа
 games_pin_message_id = None  # ID закрепленного сообщения в теме игр
+codex/find-error-in-telegram-bot-code-2crs1s
+DATA_FILE = os.environ.get('BOT_DATA_FILE', 'data.json')
+DATA_LOCK = threading.Lock()
+=======
+main
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 
-def send_telegram_message(chat_id, text, reply_to_message_id=None, topic_id=None, parse_mode='HTML'):
+def send_telegram_message(
+    chat_id,
+    text,
+    reply_to_message_id=None,
+    topic_id=None,
+    parse_mode='HTML',
+    reply_markup=None
+):
     """Отправка сообщения в Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     
@@ -75,6 +88,9 @@ def send_telegram_message(chat_id, text, reply_to_message_id=None, topic_id=None
     
     if topic_id and (chat_id == GROUP_ID or str(chat_id).startswith('@') or (isinstance(chat_id, int) and chat_id < 0)):
         payload['message_thread_id'] = topic_id
+
+    if reply_markup:
+        payload['reply_markup'] = reply_markup
     
     try:
         response = requests.post(url, json=payload, timeout=10)
@@ -84,6 +100,71 @@ def send_telegram_message(chat_id, text, reply_to_message_id=None, topic_id=None
         logger.error(f"Ошибка отправки сообщения: {e}")
         return None
 
+codex/find-error-in-telegram-bot-code-2crs1s
+def save_data():
+    """Сохранение данных в JSON файл"""
+    with DATA_LOCK:
+        payload = {
+            'users': users,
+            'articles_queue': list(articles_queue),
+            'published_articles': published_articles,
+            'user_articles': dict(user_articles),
+            'user_balances': dict(user_balances),
+            'user_last_submit': {
+                str(k): v.isoformat() for k, v in user_last_submit.items()
+            },
+            'user_daily_reward': user_daily_reward,
+            'games_history': games_history,
+            'duels': duels,
+            'games_results': games_results,
+            'games_pin_message_id': games_pin_message_id
+        }
+        try:
+            with open(DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения данных: {e}")
+
+def load_data():
+    """Загрузка данных из JSON файла"""
+    global users, articles_queue, published_articles, user_articles
+    global user_balances, user_last_submit, user_daily_reward
+    global games_history, duels, games_results, games_pin_message_id
+
+    if not os.path.exists(DATA_FILE):
+        return
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        users = data.get('users', {})
+        articles_queue = deque(data.get('articles_queue', []), maxlen=10)
+        published_articles = data.get('published_articles', [])
+        user_articles = defaultdict(list, data.get('user_articles', {}))
+        user_balances = defaultdict(int, data.get('user_balances', {}))
+        user_last_submit = {
+            int(k): datetime.fromisoformat(v)
+            for k, v in data.get('user_last_submit', {}).items()
+        }
+        user_daily_reward = data.get('user_daily_reward', {})
+        games_history = data.get('games_history', [])
+        duels = data.get('duels', [])
+        games_results = data.get('games_results', [])
+        games_pin_message_id = data.get('games_pin_message_id')
+        logger.info("✅ Данные загружены из файла")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки данных: {e}")
+
+def schedule_data_saves(interval_seconds=60):
+    """Периодическое сохранение данных"""
+    def save_loop():
+        while True:
+            time.sleep(interval_seconds)
+            save_data()
+    thread = threading.Thread(target=save_loop, daemon=True)
+    thread.start()
+
+
+main
 def delete_telegram_message(chat_id, message_id):
     """Удаление сообщения в Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
@@ -100,13 +181,29 @@ def schedule_message_deletion(chat_id, message_id, delay_seconds):
     """Планирование удаления сообщения"""
     threading.Timer(delay_seconds, delete_telegram_message, args=[chat_id, message_id]).start()
 
+    codex/find-error-in-telegram-bot-code-2crs1s
+def send_temporary_message(
+    chat_id,
+    text,
+    delete_after_seconds,
+    reply_to_message_id=None,
+    topic_id=None,
+    reply_markup=None
+):
+
 def send_temporary_message(chat_id, text, delete_after_seconds, reply_to_message_id=None, topic_id=None):
+main
     """Отправка временного сообщения, удаляемого через заданное время"""
     result = send_telegram_message(
         chat_id,
         text,
         reply_to_message_id=reply_to_message_id,
+      codex/find-error-in-telegram-bot-code-2crs1s
+        topic_id=topic_id,
+        reply_markup=reply_markup
+
         topic_id=topic_id
+main
     )
     if result and 'result' in result:
         schedule_message_deletion(chat_id, result['result']['message_id'], delete_after_seconds)
@@ -397,6 +494,42 @@ def update_games_pin():
         }
         requests.post(pin_url, json=pin_payload, timeout=10)
 
+codex/find-error-in-telegram-bot-code-2crs1s
+def build_main_menu_keyboard():
+    """Создать inline-клавиатуру основного меню"""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📜 Правила", "callback_data": "menu_rules"},
+                {"text": "📋 Очередь", "callback_data": "menu_queue"}
+            ],
+            [
+                {"text": "👤 Профиль", "callback_data": "menu_profile"},
+                {"text": "🏆 Топ", "callback_data": "menu_top"}
+            ],
+            [
+                {"text": "🎮 Игры", "callback_data": "menu_games"},
+                {"text": "💰 Баланс", "callback_data": "menu_balance"}
+            ],
+            [
+                {"text": "🎁 Ежедневная награда", "callback_data": "menu_daily"},
+                {"text": "✍️ Подать статью", "callback_data": "menu_submit"}
+            ]
+        ]
+    }
+
+def show_main_menu(chat_id):
+    """Показать меню управления через кнопки"""
+    menu_text = (
+        "<b>🧭 МЕНЮ КЛУБА</b>\n"
+        "Выберите действие кнопкой ниже."
+    )
+    send_telegram_message(
+        chat_id,
+        menu_text,
+        reply_markup=build_main_menu_keyboard()
+    )
+main
 # ============ ИГРЫ И АКТИВНОСТИ ============
 
 def start_paragraph_duel(initiator_id, topic=None):
@@ -872,9 +1005,11 @@ def process_command(chat_id, user_id, text, message):
                 'last_name': message['from'].get('last_name', '')
             }
             register_user(user_data)
+        show_main_menu(chat_id)
     
     elif command == '/help':
         show_help(chat_id, user_id)
+        show_main_menu(chat_id)
     
     elif command == '/rules':
         show_rules(chat_id)
@@ -1012,10 +1147,34 @@ def process_callback(callback):
     callback_id = callback['id']
     user_id = callback['from']['id']
     data = callback['data']
+    chat_id = callback.get('message', {}).get('chat', {}).get('id') or user_id
     
     # Здесь можно добавить обработку нажатий на inline-кнопки
-    # Пока просто отвечаем
-    send_telegram_message(user_id, f"Callback получен: {data}")
+    if data == 'menu_rules':
+        show_rules(chat_id)
+    elif data == 'menu_queue':
+        show_queue(chat_id)
+    elif data == 'menu_profile':
+        show_profile(user_id)
+    elif data == 'menu_top':
+        show_top(chat_id)
+    elif data == 'menu_games':
+        show_games_menu(chat_id, user_id)
+    elif data == 'menu_balance':
+        show_balance(user_id)
+    elif data == 'menu_daily':
+        give_daily_reward(user_id)
+    elif data == 'menu_submit':
+        if chat_id == user_id:
+            start_article_submission(user_id)
+        else:
+            send_temporary_message(
+                user_id,
+                "Чтобы подать статью, напишите боту в личные сообщения и нажмите «Подать статью».",
+                60
+            )
+    else:
+        send_temporary_message(user_id, f"Callback получен: {data}", 60)
     
     # Подтверждаем получение callback
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
@@ -1029,12 +1188,12 @@ def show_help(chat_id, user_id):
 <b>📚 КЛУБ "УВЛЕКАТЕЛЬНЫЕ ЧТЕНИЯ"</b>
 ────────────────────
 <b>👋 ДЛЯ НОВИЧКОВ:</b>
+Кнопки меню в группе — основной способ управления
 /start - Регистрация и приветствие
-/rules - Правила клуба
-/queue - Очередь публикаций
 /help - Эта справка
 
 <b>✍️ ДЛЯ АВТОРОВ:</b>
+Кнопка «Подать статью» работает в ЛС с ботом
 /submit - Подать статью в очередь (только в ЛС)
 /my_posts - Мои статьи
 /when_can_submit - Когда можно подать следующую статью
@@ -1896,6 +2055,9 @@ def set_webhook():
         return f"❌ Ошибка подключения: {str(e)}"
 
 if __name__ == '__main__':
+    load_data()
+    schedule_data_saves()
+    atexit.register(save_data)
     # Запускаем планировщик задач
     schedule_daily_tasks()
     
