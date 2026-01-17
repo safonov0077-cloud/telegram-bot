@@ -4,11 +4,11 @@ import logging
 import threading
 import time
 import re
-import atexit
-import random
+import sqlite3
 from datetime import datetime, timedelta
-from collections import defaultdict, deque
+from collections import defaultdict
 from urllib.parse import urlparse
+from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 from flask import Flask, request, jsonify
@@ -26,34 +26,17 @@ logger = logging.getLogger("clubbot")
 
 app = Flask(__name__)
 
-# ТОКЕН ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-if not TELEGRAM_TOKEN:
-    logger.error("❌ TELEGRAM_TOKEN пустой! Задайте переменную окружения TELEGRAM_TOKEN")
-    TELEGRAM_TOKEN = ""
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip()
+GROUP_ID = int(os.environ.get("GROUP_ID", "-1003646270051"))
+TOPIC_QUEUE_ID = int(os.environ.get("TOPIC_QUEUE_ID", "0"))
+DB_PATH = os.environ.get("DB_PATH", "clubbot.sqlite3").strip()
 
-# ID ГРУППЫ (получен через @getidsbot)
-GROUP_ID = "-1003646270051"  # Ваша группа @uvlekatelnyechteniya
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", "1039651708").split(",")
+    if x.strip().isdigit()
+}
 
-# ID администратора
-ADMIN_IDS = {1039651708}
-
-# Временное хранение данных в памяти
-users = {}
-articles_queue = deque(maxlen=10)
-published_articles = []
-user_articles = defaultdict(list)
-user_balances = defaultdict(int)
-user_last_submit = {}
-user_daily_reward = {}
-user_submit_notified = {}
-user_states = {}
-
-# Игры
-games_history = []
-duels = []
-
-# Тексты
 ALLOWED_PLATFORMS_TEXT = "VK, Дзен, Telegram"
 ALLOWED_DOMAINS = {
     "vk.com", "m.vk.com",
@@ -61,57 +44,515 @@ ALLOWED_DOMAINS = {
     "t.me", "telegra.ph",
 }
 
+URL_RE = re.compile(r"(https?://\S+)", re.I)
+
+if not TELEGRAM_TOKEN:
+    logger.error("TELEGRAM_TOKEN пустой. Бот не сможет работать.")
+
+# =========================
+# STORAGE (SQLite)
+# =========================
+
+class Storage:
+    def __init__(self, path: str):
+        self.path = path
+        self.lock = threading.RLock()
+        self.local = threading.local()
+        self._init_db()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = getattr(self.local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            self.local.conn = conn
+        return conn
+
+    def _exec(self, sql: str, params: Tuple = ()) -> None:
+        with self.lock:
+            conn = self._get_conn()
+            conn.execute(sql, params)
+            conn.commit()
+
+    def _exec_many(self, sql: str, seq_of_params: List[Tuple]) -> None:
+        with self.lock:
+            conn = self._get_conn()
+            conn.executemany(sql, seq_of_params)
+            conn.commit()
+
+    def _query_one(self, sql: str, params: Tuple = ()) -> Optional[sqlite3.Row]:
+        conn = self._get_conn()
+        cur = conn.execute(sql, params)
+        return cur.fetchone()
+
+    def _query_all(self, sql: str, params: Tuple = ()) -> List[sqlite3.Row]:
+        conn = self._get_conn()
+        cur = conn.execute(sql, params)
+        return cur.fetchall()
+
+    def _init_db(self) -> None:
+        with self.lock:
+            conn = sqlite3.connect(self.path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS meta (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                registered_at TEXT,
+                last_active TEXT,
+                articles_count INTEGER DEFAULT 0,
+                feedback_given INTEGER DEFAULT 0,
+                games_played INTEGER DEFAULT 0,
+                total_quotes INTEGER DEFAULT 0,
+                badges_json TEXT DEFAULT '["новичок"]'
+            );
+
+            CREATE TABLE IF NOT EXISTS balances (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS user_state (
+                user_id INTEGER PRIMARY KEY,
+                last_submit_at TEXT,
+                daily_reward_date TEXT,
+                submit_notified_at TEXT,
+                state TEXT,
+                state_started_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS submissions (
+                article_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                submitted_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS queue (
+                position INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_id TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                queued_at TEXT NOT NULL,
+                FOREIGN KEY(article_id) REFERENCES submissions(article_id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS published (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                published_at TEXT NOT NULL,
+                list_date TEXT NOT NULL,
+                FOREIGN KEY(article_id) REFERENCES submissions(article_id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS games_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS duels (
+                duel_id TEXT PRIMARY KEY,
+                topic TEXT NOT NULL,
+                initiator INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                prize INTEGER NOT NULL,
+                thread_id INTEGER,
+                announce_message_id INTEGER,
+                vote_message_id INTEGER,
+                submissions_deadline TEXT,
+                vote_deadline TEXT,
+                participants_json TEXT DEFAULT '[]',
+                paragraphs_json TEXT DEFAULT '{}',
+                votes_json TEXT DEFAULT '{}',
+                winner INTEGER,
+                FOREIGN KEY(initiator) REFERENCES users(id) ON DELETE CASCADE
+            );
+            """)
+
+            conn.commit()
+            conn.close()
+
+    # ---- meta ----
+    def get_meta(self, k: str) -> Optional[str]:
+        row = self._query_one("SELECT v FROM meta WHERE k = ?", (k,))
+        return row["v"] if row else None
+
+    def set_meta(self, k: str, v: str) -> None:
+        self._exec("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+
+    # ---- users ----
+    def is_registered(self, user_id: int) -> bool:
+        row = self._query_one("SELECT 1 FROM users WHERE id=?", (int(user_id),))
+        return bool(row)
+
+    def upsert_user(self, user_data: Dict[str, Any]) -> None:
+        uid = int(user_data["id"])
+        now = datetime.now().isoformat()
+        username = user_data.get("username")
+        first_name = user_data.get("first_name", "")
+        last_name = user_data.get("last_name", "")
+
+        with self.lock:
+            conn = self._get_conn()
+            existing = conn.execute("SELECT id FROM users WHERE id=?", (uid,)).fetchone()
+            if not existing:
+                conn.execute(
+                    """INSERT INTO users(id, username, first_name, last_name, registered_at, last_active, total_quotes)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (uid, username, first_name, last_name, now, now, 50)
+                )
+                conn.execute("INSERT INTO balances(user_id, balance) VALUES(?,?)", (uid, 50))
+                conn.execute("INSERT INTO user_state(user_id) VALUES(?)", (uid,))
+            else:
+                conn.execute(
+                    """UPDATE users SET username=?, first_name=?, last_name=?, last_active=?
+                       WHERE id=?""",
+                    (username, first_name, last_name, now, uid)
+                )
+            conn.commit()
+
+    def set_last_active(self, user_id: int) -> None:
+        self._exec("UPDATE users SET last_active=? WHERE id=?", (datetime.now().isoformat(), int(user_id)))
+
+    def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        row = self._query_one("SELECT * FROM users WHERE id=?", (int(user_id),))
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["badges"] = json.loads(d.get("badges_json") or "[]")
+        except Exception:
+            d["badges"] = ["новичок"]
+        return d
+
+    def get_balance(self, user_id: int) -> int:
+        row = self._query_one("SELECT balance FROM balances WHERE user_id=?", (int(user_id),))
+        return int(row["balance"]) if row else 0
+
+    def add_quotes(self, user_id: int, amount: int, reason: str) -> int:
+        uid = int(user_id)
+        amt = int(amount)
+        with self.lock:
+            conn = self._get_conn()
+            conn.execute("UPDATE balances SET balance = balance + ? WHERE user_id=?", (amt, uid))
+            conn.execute("UPDATE users SET total_quotes = total_quotes + ? WHERE id=?", (amt, uid))
+            conn.commit()
+        logger.info(f"quotes +{amt} to {uid} ({reason})")
+        return self.get_balance(uid)
+
+    def spend_quotes(self, user_id: int, amount: int, reason: str) -> bool:
+        uid = int(user_id)
+        amt = int(amount)
+        with self.lock:
+            conn = self._get_conn()
+            row = conn.execute("SELECT balance FROM balances WHERE user_id=?", (uid,)).fetchone()
+            bal = int(row["balance"]) if row else 0
+            if bal < amt:
+                return False
+            conn.execute("UPDATE balances SET balance = balance - ? WHERE user_id=?", (amt, uid))
+            conn.commit()
+        logger.info(f"quotes -{amt} from {uid} ({reason})")
+        return True
+
+    # ---- user_state ----
+    def get_last_submit_at(self, user_id: int) -> Optional[datetime]:
+        row = self._query_one("SELECT last_submit_at FROM user_state WHERE user_id=?", (int(user_id),))
+        if row and row["last_submit_at"]:
+            try:
+                return datetime.fromisoformat(row["last_submit_at"])
+            except Exception:
+                return None
+        return None
+
+    def set_last_submit_at(self, user_id: int, dt: datetime) -> None:
+        self._exec("UPDATE user_state SET last_submit_at=? WHERE user_id=?", (dt.isoformat(), int(user_id)))
+
+    def get_daily_reward_date(self, user_id: int) -> Optional[str]:
+        row = self._query_one("SELECT daily_reward_date FROM user_state WHERE user_id=?", (int(user_id),))
+        return row["daily_reward_date"] if row else None
+
+    def set_daily_reward_date(self, user_id: int, date_iso: str) -> None:
+        self._exec("UPDATE user_state SET daily_reward_date=? WHERE user_id=?", (date_iso, int(user_id)))
+
+    def get_submit_notified_at(self, user_id: int) -> Optional[datetime]:
+        row = self._query_one("SELECT submit_notified_at FROM user_state WHERE user_id=?", (int(user_id),))
+        if row and row["submit_notified_at"]:
+            try:
+                return datetime.fromisoformat(row["submit_notified_at"])
+            except Exception:
+                return None
+        return None
+
+    def set_submit_notified_at(self, user_id: int, dt: datetime) -> None:
+        self._exec("UPDATE user_state SET submit_notified_at=? WHERE user_id=?", (dt.isoformat(), int(user_id)))
+
+    def set_state(self, user_id: int, state: str) -> None:
+        now = datetime.now().isoformat()
+        self._exec(
+            "UPDATE user_state SET state=?, state_started_at=? WHERE user_id=?",
+            (state, now, int(user_id))
+        )
+
+    def clear_state(self, user_id: int) -> None:
+        self._exec("UPDATE user_state SET state=NULL, state_started_at=NULL WHERE user_id=?", (int(user_id),))
+
+    def get_state(self, user_id: int) -> Optional[str]:
+        row = self._query_one("SELECT state FROM user_state WHERE user_id=?", (int(user_id),))
+        return row["state"] if row else None
+
+    # ---- submissions + queue ----
+    def queue_count(self) -> int:
+        row = self._query_one("SELECT COUNT(*) AS c FROM queue")
+        return int(row["c"]) if row else 0
+
+    def queue_has_user(self, user_id: int) -> bool:
+        row = self._query_one("SELECT 1 FROM queue WHERE user_id=? LIMIT 1", (int(user_id),))
+        return bool(row)
+
+    def add_submission_and_queue(self, user_id: int, url: str) -> str:
+        uid = int(user_id)
+        article_id = f"art_{int(time.time())}_{uid}"
+        now = datetime.now().isoformat()
+        with self.lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO submissions(article_id,user_id,url,submitted_at,status) VALUES(?,?,?,?,?)",
+                (article_id, uid, url, now, "pending")
+            )
+            conn.execute(
+                "INSERT INTO queue(article_id,user_id,queued_at) VALUES(?,?,?)",
+                (article_id, uid, now)
+            )
+            conn.execute("UPDATE user_state SET last_submit_at=? WHERE user_id=?", (now, uid))
+            conn.execute("UPDATE users SET articles_count = articles_count + 1 WHERE id=?", (uid,))
+            conn.commit()
+        return article_id
+
+    def list_queue(self, limit: int = 10) -> List[Dict[str, Any]]:
+        rows = self._query_all(
+            """SELECT q.position, s.article_id, s.user_id, s.url, s.submitted_at
+               FROM queue q
+               JOIN submissions s ON s.article_id = q.article_id
+               ORDER BY q.position ASC
+               LIMIT ?""",
+            (int(limit),)
+        )
+        return [dict(r) for r in rows]
+
+    def pop_from_queue(self, n: int) -> List[Dict[str, Any]]:
+        with self.lock:
+            conn = self._get_conn()
+            rows = conn.execute(
+                """SELECT q.position, s.article_id, s.user_id, s.url, s.submitted_at
+                   FROM queue q
+                   JOIN submissions s ON s.article_id = q.article_id
+                   ORDER BY q.position ASC
+                   LIMIT ?""",
+                (int(n),)
+            ).fetchall()
+
+            if not rows:
+                return []
+
+            positions = [int(r["position"]) for r in rows]
+            conn.executemany("DELETE FROM queue WHERE position=?", [(p,) for p in positions])
+            conn.commit()
+
+        return [dict(r) for r in rows]
+
+    def add_published(self, article: Dict[str, Any], list_date: str) -> None:
+        with self.lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO published(article_id,user_id,url,published_at,list_date) VALUES(?,?,?,?,?)",
+                (article["article_id"], int(article["user_id"]), article["url"], datetime.now().isoformat(), list_date)
+            )
+            conn.execute("UPDATE submissions SET status='published' WHERE article_id=?", (article["article_id"],))
+            conn.commit()
+
+    def list_user_submissions(self, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        rows = self._query_all(
+            """SELECT article_id, url, submitted_at, status
+               FROM submissions
+               WHERE user_id=?
+               ORDER BY submitted_at DESC
+               LIMIT ?""",
+            (int(user_id), int(limit))
+        )
+        return [dict(r) for r in rows]
+
+    # ---- top ----
+    def top_users(self, limit: int = 10) -> List[Dict[str, Any]]:
+        rows = self._query_all(
+            """SELECT u.id, u.username, u.first_name, u.last_name, u.articles_count, b.balance
+               FROM users u
+               JOIN balances b ON b.user_id = u.id
+               ORDER BY b.balance DESC
+               LIMIT ?""",
+            (int(limit),)
+        )
+        return [dict(r) for r in rows]
+
+    def rank_of_user(self, user_id: int) -> Tuple[int, int]:
+        uid = int(user_id)
+        row_total = self._query_one("SELECT COUNT(*) AS c FROM users")
+        total = int(row_total["c"]) if row_total else 0
+        rows = self._query_all(
+            """SELECT u.id
+               FROM users u
+               JOIN balances b ON b.user_id = u.id
+               ORDER BY b.balance DESC"""
+        )
+        rank = total
+        for i, r in enumerate(rows, 1):
+            if int(r["id"]) == uid:
+                rank = i
+                break
+        return rank, total
+
+    # ---- games ----
+    def add_game_history(self, game_type: str, payload: Dict[str, Any]) -> None:
+        self._exec(
+            "INSERT INTO games_history(game_type,payload_json,created_at) VALUES(?,?,?)",
+            (game_type, json.dumps(payload, ensure_ascii=False), datetime.now().isoformat())
+        )
+
+    # ---- duels ----
+    def create_duel(self, duel_id: str, topic: str, initiator: int, prize: int, thread_id: Optional[int],
+                    announce_message_id: Optional[int], submissions_deadline: datetime) -> None:
+        self._exec(
+            """INSERT INTO duels(duel_id,topic,initiator,status,created_at,prize,thread_id,announce_message_id,submissions_deadline)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                duel_id, topic, int(initiator), "waiting", datetime.now().isoformat(), int(prize),
+                int(thread_id) if thread_id else None,
+                int(announce_message_id) if announce_message_id else None,
+                submissions_deadline.isoformat()
+            )
+        )
+
+    def get_active_duel_waiting(self) -> Optional[Dict[str, Any]]:
+        row = self._query_one("SELECT * FROM duels WHERE status='waiting' ORDER BY created_at DESC LIMIT 1")
+        return dict(row) if row else None
+
+    def get_active_duel_voting(self) -> Optional[Dict[str, Any]]:
+        row = self._query_one("SELECT * FROM duels WHERE status='voting' ORDER BY created_at DESC LIMIT 1")
+        return dict(row) if row else None
+
+    def get_duel_by_id(self, duel_id: str) -> Optional[Dict[str, Any]]:
+        row = self._query_one("SELECT * FROM duels WHERE duel_id=?", (duel_id,))
+        return dict(row) if row else None
+
+    def update_duel_json_fields(self, duel_id: str, participants: List[int], paragraphs: Dict[str, str], votes: Dict[str, int]) -> None:
+        self._exec(
+            """UPDATE duels SET participants_json=?, paragraphs_json=?, votes_json=? WHERE duel_id=?""",
+            (
+                json.dumps(participants, ensure_ascii=False),
+                json.dumps(paragraphs, ensure_ascii=False),
+                json.dumps(votes, ensure_ascii=False),
+                duel_id
+            )
+        )
+
+    def set_duel_status(self, duel_id: str, status: str) -> None:
+        self._exec("UPDATE duels SET status=? WHERE duel_id=?", (status, duel_id))
+
+    def set_duel_voting(self, duel_id: str, vote_message_id: int, vote_deadline: datetime) -> None:
+        self._exec(
+            "UPDATE duels SET status='voting', vote_message_id=?, vote_deadline=? WHERE duel_id=?",
+            (int(vote_message_id), vote_deadline.isoformat(), duel_id)
+        )
+
+    def set_duel_winner(self, duel_id: str, winner_id: Optional[int]) -> None:
+        self._exec("UPDATE duels SET winner=? WHERE duel_id=?", (int(winner_id) if winner_id else None, duel_id))
+
+    def list_duels_due(self, now: datetime) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        waiting = self._query_all(
+            "SELECT * FROM duels WHERE status='waiting' AND submissions_deadline IS NOT NULL AND submissions_deadline <= ?",
+            (now.isoformat(),)
+        )
+        voting = self._query_all(
+            "SELECT * FROM duels WHERE status='voting' AND vote_deadline IS NOT NULL AND vote_deadline <= ?",
+            (now.isoformat(),)
+        )
+        return ([dict(r) for r in waiting], [dict(r) for r in voting])
+
+store = Storage(DB_PATH)
+
 # =========================
 # TELEGRAM API
 # =========================
 
 def tg(method: str, payload: dict, timeout: int = 12):
-    """Базовый вызов Telegram API"""
     if not TELEGRAM_TOKEN:
-        logger.error("Токен не установлен!")
+        logger.error("TELEGRAM_TOKEN не установлен")
         return None
-        
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
     try:
-        response = requests.post(url, json=payload, timeout=timeout)
-        response.raise_for_status()
-        data = response.json()
+        resp = requests.post(url, json=payload, timeout=timeout)
+        data = resp.json()
         if not data.get("ok"):
-            logger.error(f"Telegram API error {method}: {data}")
+            logger.error(f"Telegram API error {method}: {data.get('description')} | keys={list(payload.keys())}")
         return data
     except Exception as e:
         logger.error(f"Telegram request failed {method}: {e}")
         return None
 
-def send_telegram_message(chat_id, text, parse_mode="HTML", reply_markup=None):
-    """Отправка сообщения в Telegram"""
+def send_telegram_message(chat_id, text, parse_mode="HTML", reply_markup=None, message_thread_id=None, reply_to_message_id=None):
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    
-    logger.info(f"📤 Отправка сообщения в {chat_id}: {text[:100]}...")
+    if message_thread_id:
+        payload["message_thread_id"] = int(message_thread_id)
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = int(reply_to_message_id)
+
+    logger.info(f"sendMessage -> chat_id={chat_id} thread={message_thread_id} text={str(text)[:120]}...")
     return tg("sendMessage", payload)
 
 def answer_callback(callback_query_id, text, show_alert=False):
-    """Ответ на callback query"""
-    payload = {
+    return tg("answerCallbackQuery", {
         "callback_query_id": callback_query_id,
         "text": text,
         "show_alert": show_alert
-    }
-    return tg("answerCallbackQuery", payload)
+    })
 
 # =========================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ
 # =========================
 
 def html_escape(s: str) -> str:
-    """Экранирование HTML"""
     if s is None:
         return ""
     return (
@@ -123,7 +564,6 @@ def html_escape(s: str) -> str:
     )
 
 def normalize_command(text: str) -> str:
-    """Нормализация команды"""
     if not text:
         return ""
     cmd = text.split()[0].strip().lower()
@@ -132,16 +572,14 @@ def normalize_command(text: str) -> str:
     return cmd
 
 def safe_username(user_id: int) -> str:
-    """Безопасное получение username"""
-    user = users.get(user_id, {})
-    username = user.get("username")
+    u = store.get_user(user_id) or {}
+    username = u.get("username")
     if username:
         return "@" + username
-    name = (user.get("first_name", "") + " " + user.get("last_name", "")).strip()
+    name = (u.get("first_name", "") + " " + u.get("last_name", "")).strip()
     return name if name else f"пользователь {user_id}"
 
 def parse_domain(url: str) -> str:
-    """Парсинг домена из URL"""
     try:
         parsed = urlparse(url.strip())
         return (parsed.netloc or "").lower()
@@ -149,1009 +587,724 @@ def parse_domain(url: str) -> str:
         return ""
 
 def is_allowed_article_url(url: str) -> bool:
-    """Проверка допустимости URL"""
     if not url or not isinstance(url, str):
         return False
-    
     url = url.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         return False
-    
     domain = parse_domain(url)
-    if not domain:
-        return False
-    
-    # Убираем www.
     if domain.startswith("www."):
         domain = domain[4:]
-    
-    # Проверяем домен и поддомены
-    for allowed_domain in ALLOWED_DOMAINS:
-        if domain == allowed_domain or domain.endswith("." + allowed_domain):
+    for allowed in ALLOWED_DOMAINS:
+        if domain == allowed or domain.endswith("." + allowed):
             return True
-    
     return False
 
+def extract_first_url(text: str) -> str:
+    if not text:
+        return ""
+    m = URL_RE.search(text.strip())
+    return m.group(1).strip() if m else ""
+
+def choose_thread_id(incoming_thread_id: Optional[int], forced_topic_id: int = 0) -> Optional[int]:
+    if forced_topic_id and forced_topic_id > 0:
+        return forced_topic_id
+    return incoming_thread_id if incoming_thread_id else None
+
 # =========================
-# РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЕЙ
+# ЛОГИКА КЛУБА
 # =========================
 
-def is_user_registered(user_id: int) -> bool:
-    """Проверка регистрации пользователя"""
-    return user_id in users
+def can_submit_article(user_id: int) -> Tuple[bool, str]:
+    uid = int(user_id)
 
-def register_user(user_data: dict) -> bool:
-    """Регистрация нового пользователя"""
-    user_id = int(user_data["id"])
-    
-    if user_id in users:
-        return True
-    
-    users[user_id] = {
-        "id": user_id,
-        "username": user_data.get("username"),
-        "first_name": user_data.get("first_name", ""),
-        "last_name": user_data.get("last_name", ""),
-        "registered_at": datetime.now().isoformat(),
-        "articles_count": 0,
-        "feedback_given": 0,
-        "games_played": 0,
-        "total_quotes": 50,
-        "badges": ["новичок"],
-        "last_active": datetime.now().isoformat()
-    }
-    
-    user_balances[user_id] = 50  # Стартовый бонус
-    
+    last_submit = store.get_last_submit_at(uid)
+    if last_submit:
+        diff = datetime.now() - last_submit
+        if diff.total_seconds() < 48 * 3600:
+            hours_left = int((48 * 3600 - diff.total_seconds()) / 3600)
+            if hours_left < 1:
+                return False, "Можно будет подать менее чем через час"
+            return False, f"Можно будет подать через {hours_left} часов"
+
+    if store.queue_has_user(uid):
+        return False, "У тебя уже есть ссылка в очереди"
+
+    if store.queue_count() >= 10:
+        return False, "Очередь заполнена (максимум 10 ссылок)"
+
+    return True, "Можно подавать"
+
+def register_user(user_data: dict) -> None:
+    store.upsert_user(user_data)
+
     welcome_text = f"""📚 <b>Увлекательные чтения</b>
 
-Добро пожаловать в клуб, где ценят реальные отзывы, а не обмен лайками!
+Добро пожаловать в клуб, где ценят реальные отзывы, а не обмен лайками.
 
 🎯 <b>Как начать:</b>
 1. <b>/daily</b> - ежедневная награда (5 кавычек)
-2. <b>/balance</b> - проверить баланс
-3. <b>/queue</b> - посмотреть очередь статей (в группе)
-4. <b>/submit</b> - подать свою статью
+2. <b>/balance</b> - баланс
+3. <b>/queue</b> - очередь (в группе или в личке)
+4. <b>/submit</b> - подать статью (ссылкой)
 
 📜 <b>Правила:</b>
-• 1 статья раз в 48-72 часа
+• 1 ссылка раз в 48-72 часа
 • Ссылки только: {ALLOWED_PLATFORMS_TEXT}
 • Реальные отзывы, а не "норм"
 
-💰 <b>Баланс:</b> 50 кавычек (стартовый бонус)
+💰 <b>Старт:</b> 50 кавычек 🪙
 
-Пиши <b>/help</b> для списка команд!"""
-    
-    send_telegram_message(user_id, welcome_text)
-    logger.info(f"✅ Зарегистрирован новый пользователь: {user_id}")
-    return True
+Пиши <b>/help</b> для списка команд."""
+    send_telegram_message(int(user_data["id"]), welcome_text)
 
-# =========================
-# СИСТЕМА КАВЫЧЕК
-# =========================
+def show_help(chat_id: int, thread_id: Optional[int] = None) -> None:
+    text = f"""📚 <b>Команды</b>
 
-def add_quotes(user_id: int, amount: int, reason: str) -> int:
-    """Начисление кавычек"""
-    user_id = int(user_id)
-    user_balances[user_id] = user_balances.get(user_id, 0) + int(amount)
-    
-    if user_id in users:
-        users[user_id]["total_quotes"] = users[user_id].get("total_quotes", 0) + int(amount)
-    
-    logger.info(f"💰 {user_id}: +{amount} кавычек ({reason})")
-    return user_balances[user_id]
-
-def spend_quotes(user_id: int, amount: int, reason: str) -> bool:
-    """Списание кавычек"""
-    user_id = int(user_id)
-    amount = int(amount)
-    
-    if user_balances.get(user_id, 0) < amount:
-        return False
-    
-    user_balances[user_id] -= amount
-    logger.info(f"🪙 {user_id}: -{amount} кавычек ({reason})")
-    return True
-
-# =========================
-# ОЧЕРЕДЬ СТАТЕЙ
-# =========================
-
-def can_submit_article(user_id: int):
-    """Проверка возможности подачи статьи"""
-    user_id = int(user_id)
-    
-    # Если пользователь никогда не подавал
-    if user_id not in user_last_submit:
-        return True, "✅ Можно подавать статью"
-    
-    last_submit = user_last_submit[user_id]
-    time_diff = datetime.now() - last_submit
-    
-    # Минимум 48 часов между подачами
-    min_hours = 48
-    if time_diff.total_seconds() < min_hours * 3600:
-        hours_left = int((min_hours * 3600 - time_diff.total_seconds()) / 3600)
-        return False, f"⏳ Можно будет подать через {hours_left} часов"
-    
-    # Максимум 1 активная статья в очереди
-    if any(article["user_id"] == user_id for article in articles_queue):
-        return False, "⚠️ У тебя уже есть статья в очереди"
-    
-    # Максимум 10 статей в очереди
-    if len(articles_queue) >= 10:
-        return False, "📦 Очередь заполнена (максимум 10 статей)"
-    
-    return True, "✅ Можно подавать статью"
-
-def add_article_to_queue(user_id: int, title: str, description: str, url: str) -> str:
-    """Добавление статьи в очередь"""
-    user_id = int(user_id)
-    article_id = f"art_{int(time.time())}_{user_id}"
-    
-    article = {
-        "id": article_id,
-        "user_id": user_id,
-        "title": title[:120],
-        "description": description[:600],
-        "url": url,
-        "submitted_at": datetime.now().isoformat(),
-        "status": "pending",
-        "feedback_count": 0
-    }
-    
-    articles_queue.append(article)
-    user_articles[user_id].append(article)
-    user_last_submit[user_id] = datetime.now()
-    
-    # Награда за подачу
-    add_quotes(user_id, 10, "Подача статьи")
-    if user_id in users:
-        users[user_id]["articles_count"] = users[user_id].get("articles_count", 0) + 1
-    
-    logger.info(f"📝 Добавлено в очередь: {article_id}")
-    return article_id
-
-def parse_submission_text(text: str):
-    """Парсинг текста подачи статьи"""
-    text = (text or "").strip()
-    
-    # Ищем блоки по маркерам
-    def get_block(marker):
-        pattern = rf"{marker}\s*\n(.+?)(?=\n[A-ZА-ЯЁ]+\n|\Z)"
-        match = re.search(pattern, text, flags=re.S | re.I)
-        return match.group(1).strip() if match else ""
-    
-    title = get_block("ЗАГОЛОВОК")
-    description = get_block("ОПИСАНИЕ")
-    link = get_block("ССЫЛКА").split()[0].strip() if get_block("ССЫЛКА") else ""
-    
-    return title, description, link
-
-# =========================
-# КОМАНДЫ ДЛЯ ЛИЧНЫХ СООБЩЕНИЙ
-# =========================
-
-def show_help(chat_id):
-    """Показать помощь"""
-    text = f"""📚 <b>Помощь по командам</b>
-
-<b>Личные команды:</b>
+<b>Личные:</b>
 /start - регистрация
 /help - помощь
 /profile - профиль
-/balance - баланс кавычек
-/daily - ежедневная награда
-/submit - подать статью
-/my_posts - мои статьи
+/balance - баланс
+/daily - ежедневка
+/submit - подать ссылку
+/my_posts - мои ссылки
 
-<b>Команды в группе:</b>
-/queue - очередь статей
-/top - топ участников
+<b>Группа:</b>
+/queue - очередь
+/top - топ
 /game - игры дня
-/rules - правила клуба
+/rules - правила
 
 <b>Важно:</b>
-• Ссылки принимаем только: {ALLOWED_PLATFORMS_TEXT}
-• 1 статья раз в 48-72 часа
-• Реальные отзывы приветствуются
+• Ссылки: {ALLOWED_PLATFORMS_TEXT}
+• Лимит: 1 ссылка раз в 48-72 часа
+"""
+    send_telegram_message(chat_id, text, message_thread_id=thread_id)
 
-Пиши команды в нужном месте! 🤖"""
-    send_telegram_message(chat_id, text)
-
-def show_profile(user_id: int, chat_id=None):
-    """Показать профиль"""
-    if not is_user_registered(user_id):
-        send_telegram_message(user_id, "Сначала зарегистрируйся через /start")
+def show_profile(user_id: int, chat_id: int, thread_id: Optional[int] = None) -> None:
+    if not store.is_registered(user_id):
+        send_telegram_message(chat_id, "Сначала зарегистрируйся через /start в личке с ботом.", message_thread_id=thread_id)
         return
-    
-    user = users[user_id]
-    balance = user_balances.get(user_id, 0)
-    
-    # Считаем рейтинг
-    all_users = list(users.items())
-    sorted_users = sorted(all_users, key=lambda x: user_balances.get(x[0], 0), reverse=True)
-    rank = next((i+1 for i, (uid, _) in enumerate(sorted_users) if uid == user_id), len(sorted_users))
-    
+
+    u = store.get_user(user_id) or {}
+    balance = store.get_balance(user_id)
+    rank, total = store.rank_of_user(user_id)
+
     text = f"""👤 <b>Профиль</b>
 
-<b>Имя:</b> {html_escape(user.get('first_name', ''))} {html_escape(user.get('last_name', ''))}
-<b>Юзернейм:</b> @{html_escape(user.get('username', 'нет'))}
-<b>Рейтинг:</b> #{rank} из {len(sorted_users)}
+<b>Имя:</b> {html_escape(u.get("first_name",""))} {html_escape(u.get("last_name",""))}
+<b>Юзернейм:</b> @{html_escape(u.get("username","нет"))}
+<b>Рейтинг:</b> #{rank} из {total}
 
 <b>Статистика:</b>
-• Статей подано: {user.get('articles_count', 0)}
-• Фидбеков дано: {user.get('feedback_given', 0)}
-• Игр сыграно: {user.get('games_played', 0)}
-• Баланс: {balance} кавычек 🪙
+• Ссылок: {u.get("articles_count",0)}
+• Фидбеков: {u.get("feedback_given",0)}
+• Игр: {u.get("games_played",0)}
+• Баланс: {balance} 🪙
+"""
+    send_telegram_message(chat_id, text, message_thread_id=thread_id)
 
-<b>Бейджи:</b> {', '.join(user.get('badges', ['новичок']))}"""
-    
-    target_chat = chat_id or user_id
-    send_telegram_message(target_chat, text)
-
-def show_rules(chat_id):
-    """Показать правила"""
+def show_rules(chat_id: int, thread_id: Optional[int] = None) -> None:
     text = f"""📜 <b>Правила клуба</b>
 
-<b>Основные принципы:</b>
-1. Качество, а не количество
-2. Взаимность: получил фидбек → дай фидбек
-3. Уважение к авторам
-4. Реальная поддержка
+<b>Принципы:</b>
+1) Качество важнее количества
+2) Взаимность: получил поддержку - поддержи
+3) Уважение к авторам
+4) Реальные отзывы
 
-<b>Очередь статей:</b>
-• 1 статья раз в 48-72 часа
-• Максимум 1 активная статья в очереди
-• Всего в очереди: до 10 статей
-• Лист чтения публикуется в 19:00 МСК
+<b>Очередь:</b>
+• 1 ссылка раз в 48-72 часа
+• 1 активная ссылка на человека
+• Очередь до 10 ссылок
+• Лист чтения в 19:00 МСК
 
 <b>Ссылки принимаем только:</b>
 {ALLOWED_PLATFORMS_TEXT}
 
 <b>Фидбек:</b>
-• Конструктивная критика
-• Что понравилось/не понравилось
+• Конструктивно
 • "Норм" не считается фидбеком
+"""
+    send_telegram_message(chat_id, text, message_thread_id=thread_id)
 
-<b>Игры и активность:</b>
-• Участие в играх поощряется
-• Кавычки начисляются за активность
-• Топ участников обновляется ежедневно
-
-Соблюдай правила, и клуб будет полезным для всех! 🤝"""
-    send_telegram_message(chat_id, text)
-
-def show_top(chat_id):
-    """Показать топ участников"""
-    if not users:
-        send_telegram_message(chat_id, "🏆 <b>Топ участников</b>\n\nПока никто не зарегистрирован. Будь первым! 🚀")
+def show_top(chat_id: int, thread_id: Optional[int] = None) -> None:
+    top = store.top_users(10)
+    if not top:
+        send_telegram_message(chat_id, "Пока никого нет в топе. Стань первым.", message_thread_id=thread_id)
         return
-    
-    # Сортируем по кавычкам
-    top_users = []
-    for user_id, user_data in users.items():
-        top_users.append({
-            "id": user_id,
-            "name": user_data.get("first_name", ""),
-            "username": user_data.get("username"),
-            "quotes": user_balances.get(user_id, 0),
-            "articles": user_data.get("articles_count", 0)
-        })
-    
-    top_users.sort(key=lambda x: x["quotes"], reverse=True)
-    
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-    
+
+    medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
     lines = ["🏆 <b>Топ участников</b>\n"]
-    for i, user in enumerate(top_users[:10]):
-        medal = medals[i] if i < len(medals) else f"{i+1}."
-        name = f"@{user['username']}" if user['username'] else user['name']
-        lines.append(f"{medal} <b>{html_escape(name)}</b> - {user['quotes']} 🪙 (статей: {user['articles']})")
-    
-    send_telegram_message(chat_id, "\n".join(lines))
+    for i, row in enumerate(top):
+        name = f"@{row['username']}" if row.get("username") else (row.get("first_name","") or f"пользователь {row['id']}")
+        lines.append(f"{medals[i]} <b>{html_escape(name)}</b> - {row['balance']} 🪙 (ссылок: {row['articles_count']})")
+    send_telegram_message(chat_id, "\n".join(lines), message_thread_id=thread_id)
 
-def show_queue(chat_id):
-    """Показать очередь статей"""
-    if not articles_queue:
-        send_telegram_message(chat_id, "📭 <b>Очередь публикаций</b>\n\nОчередь пустая. Будь первым, кто подаст статью! ✍️")
+def show_queue(chat_id: int, thread_id: Optional[int] = None) -> None:
+    q = store.list_queue(10)
+    if not q:
+        send_telegram_message(chat_id, "📭 <b>Очередь</b>\n\nПусто.", message_thread_id=thread_id)
         return
-    
+
     lines = ["📋 <b>Очередь публикаций</b>\n"]
-    
-    for i, article in enumerate(list(articles_queue)[:10], 1):
-        author = safe_username(article["user_id"])
-        title = html_escape(article["title"])
-        lines.append(f"{i}. <b>{title}</b>\n   👤 Автор: {html_escape(author)}")
-    
-    lines.append(f"\n<b>Всего в очереди:</b> {len(articles_queue)} из 10")
-    send_telegram_message(chat_id, "\n".join(lines))
+    for i, a in enumerate(q, 1):
+        author = safe_username(int(a["user_id"]))
+        url = a["url"]
+        lines.append(f"{i}. 👤 <b>{html_escape(author)}</b>\n   🔗 <a href=\"{url}\">Открыть</a>")
+    lines.append(f"\n<b>Всего:</b> {store.queue_count()} из 10")
+    send_telegram_message(chat_id, "\n".join(lines), message_thread_id=thread_id)
 
-def give_daily_reward(user_id: int):
-    """Выдать ежедневную награду"""
-    user_id = int(user_id)
+def give_daily_reward(user_id: int) -> None:
     today = datetime.now().date().isoformat()
-    
-    # Проверяем, получал ли сегодня
-    if user_daily_reward.get(str(user_id)) == today or user_daily_reward.get(user_id) == today:
-        send_telegram_message(user_id, "⏳ <b>Ежедневная награда</b>\n\nТы уже получал награду сегодня. Возвращайся завтра! 😊")
+    if store.get_daily_reward_date(user_id) == today:
+        send_telegram_message(user_id, "⏳ Ты уже получал ежедневку сегодня.")
         return
-    
-    # Выдаем награду
     reward = 5
-    new_balance = add_quotes(user_id, reward, "Ежедневная награда")
-    user_daily_reward[user_id] = today
-    
+    bal = store.add_quotes(user_id, reward, "Ежедневная награда")
+    store.set_daily_reward_date(user_id, today)
+    send_telegram_message(user_id, f"🎁 +{reward} 🪙\nНовый баланс: {bal}")
+
+def start_article_submission(user_id: int) -> None:
+    ok, msg = can_submit_article(user_id)
+    if not ok:
+        send_telegram_message(user_id, f"⏳ {html_escape(msg)}")
+        return
+    store.set_state(user_id, "awaiting_link")
     send_telegram_message(
         user_id,
-        f"🎁 <b>Ежедневная награда</b>\n\n+{reward} кавычек 🪙\n<b>Новый баланс:</b> {new_balance}\n\nВозвращайся завтра за новой наградой! 🚀"
-    )
+        f"""✍️ <b>Подача статьи</b>
 
-def start_article_submission(user_id: int):
-    """Начать процесс подачи статьи"""
-    can_submit, message = can_submit_article(user_id)
-    if not can_submit:
-        send_telegram_message(user_id, message)
-        return
-    
-    user_states[user_id] = {
-        "state": "awaiting_article",
-        "started_at": datetime.now().isoformat()
-    }
-    
-    text = f"""✍️ <b>Подача статьи</b>
-
-<b>Формат сообщения:</b>
-
-ЗАГОЛОВОК
-Твой заголовок здесь
-
-ОПИСАНИЕ
-2-3 предложения о статье
-
-ССЫЛКА
-https://example.com
+Просто отправь ссылку одним сообщением.
 
 <b>Важно:</b>
-• Ссылки принимаем только: {ALLOWED_PLATFORMS_TEXT}
-• Заголовок: до 120 символов
-• Описание: до 600 символов
-• Проверь ссылку перед отправкой
+• Только: {ALLOWED_PLATFORMS_TEXT}
+• Ссылка начинается с https://
+• Лимит: 1 ссылка раз в 48-72 часа
+"""
+    )
 
-Отправь сообщение в указанном формате."""
-    
-    send_telegram_message(user_id, text)
+def show_my_posts(user_id: int) -> None:
+    posts = store.list_user_submissions(user_id, 10)
+    if not posts:
+        send_telegram_message(user_id, "У тебя пока нет поданных ссылок.")
+        return
+    lines = ["🗂 <b>Твои ссылки</b>\n"]
+    for i, p in enumerate(posts, 1):
+        ts = (p.get("submitted_at","") or "")[:19].replace("T", " ")
+        url = p.get("url","")
+        st = p.get("status","")
+        lines.append(f"{i}. {ts} ({html_escape(st)})\n🔗 <a href=\"{url}\">Открыть</a>")
+    send_telegram_message(user_id, "\n".join(lines))
 
 # =========================
-# ИГРЫ
+# ИГРЫ: Дуэль абзацев (с сохранением)
 # =========================
 
-def show_games_menu(chat_id):
-    """Показать меню игр"""
+DUEL_TOPICS = [
+    "Утро после конца света",
+    "Разговор с зеркалом",
+    "Письмо из прошлого",
+    "Тайна старой библиотеки",
+    "Последний день лета"
+]
+
+def show_games_menu(chat_id: int, thread_id: Optional[int] = None) -> None:
     text = """🎮 <b>Игры дня</b>
 
-Выбери игру для участия:
-
-<b>1. ⚔️ Дуэль абзацев</b>
-• Напиши текст на заданную тему
-• 15 минут на написание
+<b>⚔️ Дуэль абзацев</b>
+• 3-5 предложений на тему
+• 15 минут на текст
 • 10 минут голосование
-• Приз: 25 кавычек
+• Приз: 25 🪙
 
-<b>2. 🎲 Правда или выдумка</b>
-• Угадай ложный факт
-• 10 минут на обсуждение
-• Приз: 10 кавычек
+Команды:
+/game - меню
+/duel - старт дуэли (в группе)
+"""
+    kb = {"inline_keyboard": [[{"text": "⚔️ Начать дуэль", "callback_data": "start_duel"}]]}
+    send_telegram_message(chat_id, text, reply_markup=kb, message_thread_id=thread_id)
 
-<b>3. 🎡 Колесо тем</b>
-• Напиши текст на случайную тему
-• 30 минут на написание
-• Приз: 15 кавычек
+def start_duel_in_group(initiator_id: int, thread_id: Optional[int]) -> None:
+    topic = DUEL_TOPICS[int(time.time()) % len(DUEL_TOPICS)]
+    duel_id = f"duel_{int(time.time())}_{initiator_id}"
+    prize = 25
+    deadline = datetime.utcnow() + timedelta(minutes=15)
 
-<b>Команды:</b>
-/game - это меню
-/duel - начать дуэль (в группе)"""
-    
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "⚔️ Начать дуэль", "callback_data": "start_duel"}],
-            [{"text": "🎲 Правда или выдумка", "callback_data": "truth_game"}],
-            [{"text": "🎡 Колесо тем", "callback_data": "wheel_game"}]
-        ]
-    }
-    
-    send_telegram_message(chat_id, text, reply_markup=keyboard)
-
-def start_paragraph_duel(initiator_id: int):
-    """Начать дуэль абзацев"""
-    topics = [
-        "Утро после конца света",
-        "Разговор с зеркалом", 
-        "Письмо из прошлого",
-        "Тайна старой библиотеки",
-        "Последний день лета"
-    ]
-    topic = random.choice(topics)
-    
-    duel_id = f"duel_{len(duels)}_{int(time.time())}"
-    
-    duel = {
-        "id": duel_id,
-        "topic": topic,
-        "initiator": initiator_id,
-        "participants": [],
-        "paragraphs": {},
-        "status": "waiting",
-        "created_at": datetime.now().isoformat(),
-        "votes": {},
-        "winner": None,
-        "prize": 25
-    }
-    
-    duels.append(duel)
-    
     text = f"""⚔️ <b>Дуэль абзацев началась!</b>
 
-<b>Тема:</b> {topic}
-<b>Инициатор:</b> {safe_username(initiator_id)}
-<b>Приз:</b> 25 кавычек 🪙
+<b>Тема:</b> {html_escape(topic)}
+<b>Инициатор:</b> {html_escape(safe_username(initiator_id))}
+<b>Приз:</b> {prize} 🪙
 
 <b>Правила:</b>
-1. Напиши 3-5 предложений на тему
-2. Время: 15 минут
-3. Отправь свой текст ответом на это сообщение
-4. После будет голосование (10 минут)
-
-Участвуй и побеждай! ✍️"""
-    
-    send_telegram_message(GROUP_ID, text)
-    
-    # Таймер для завершения приема текстов
-    threading.Timer(900, finish_duel_submissions, args=[duel_id]).start()
-    
-    return duel_id
-
-def finish_duel_submissions(duel_id: str):
-    """Завершить прием текстов в дуэли"""
-    duel = next((d for d in duels if d["id"] == duel_id and d["status"] == "waiting"), None)
-    if not duel:
-        return
-    
-    if len(duel["paragraphs"]) < 2:
-        send_telegram_message(GROUP_ID, "⚔️ Дуэль отменена: недостаточно участников 😔")
-        duel["status"] = "cancelled"
-        return
-    
-    duel["status"] = "voting"
-    
-    # Показываем тексты для голосования
-    text = f"""🗳 <b>Голосование в дуэли</b>
-
-<b>Тема:</b> {duel['topic']}
-<b>Участников:</b> {len(duel['paragraphs'])}
-
+1) 3-5 предложений на тему
+2) Время: 15 минут
+3) Отправь текст ответом на это сообщение
 """
-    
-    participants = list(duel["paragraphs"].items())
-    for i, (user_id, paragraph) in enumerate(participants, 1):
-        username = safe_username(user_id)
-        text += f"\n<b>#{i} - {username}</b>\n{html_escape(paragraph[:150])}...\n"
-    
-    text += "\n<b>Голосование:</b> ответь числом (1, 2, 3...) на это сообщение\n<b>Время:</b> 10 минут"
-    
-    send_telegram_message(GROUP_ID, text)
-    
-    # Таймер для завершения голосования
-    threading.Timer(600, finish_duel_voting, args=[duel_id]).start()
+    resp = send_telegram_message(GROUP_ID, text, message_thread_id=thread_id)
+    msg_id = None
+    if resp and resp.get("ok"):
+        msg_id = resp["result"]["message_id"]
 
-def finish_duel_voting(duel_id: str):
-    """Завершить голосование в дуэли"""
-    duel = next((d for d in duels if d["id"] == duel_id and d["status"] == "voting"), None)
+    store.create_duel(
+        duel_id=duel_id,
+        topic=topic,
+        initiator=initiator_id,
+        prize=prize,
+        thread_id=thread_id,
+        announce_message_id=msg_id,
+        submissions_deadline=deadline
+    )
+
+def duel_load_json(duel: Dict[str, Any]) -> Tuple[List[int], Dict[str, str], Dict[str, int]]:
+    try:
+        participants = json.loads(duel.get("participants_json") or "[]")
+        paragraphs = json.loads(duel.get("paragraphs_json") or "{}")
+        votes = json.loads(duel.get("votes_json") or "{}")
+        if not isinstance(participants, list):
+            participants = []
+        if not isinstance(paragraphs, dict):
+            paragraphs = {}
+        if not isinstance(votes, dict):
+            votes = {}
+        return participants, paragraphs, votes
+    except Exception:
+        return [], {}, {}
+
+def duel_accept_paragraph(user_id: int, text: str) -> None:
+    duel = store.get_active_duel_waiting()
     if not duel:
         return
-    
-    # Подсчет голосов
-    votes_count = defaultdict(int)
-    for vote in duel["votes"].values():
-        votes_count[vote] += 1
-    
-    if not votes_count:
-        send_telegram_message(GROUP_ID, "⚔️ Дуэль завершена: никто не проголосовал 😔")
-        duel["status"] = "finished"
+
+    participants, paragraphs, votes = duel_load_json(duel)
+
+    uid = int(user_id)
+    if str(uid) in paragraphs:
         return
-    
-    # Определяем победителя
-    winner_index = max(votes_count.items(), key=lambda x: x[1])[0]
-    participants = list(duel["paragraphs"].keys())
-    
+
+    paragraphs[str(uid)] = text.strip()
+    participants.append(uid)
+    store.update_duel_json_fields(duel["duel_id"], participants, paragraphs, votes)
+
+def duel_accept_vote(voter_id: int, vote_index: int) -> None:
+    duel = store.get_active_duel_voting()
+    if not duel:
+        return
+
+    participants, paragraphs, votes = duel_load_json(duel)
+    vid = int(voter_id)
+
+    if str(vid) in votes:
+        return
+
+    if 1 <= vote_index <= len(participants):
+        votes[str(vid)] = int(vote_index)
+        store.update_duel_json_fields(duel["duel_id"], participants, paragraphs, votes)
+
+def duel_finish_submissions(duel: Dict[str, Any]) -> None:
+    participants, paragraphs, votes = duel_load_json(duel)
+    thread_id = duel.get("thread_id")
+
+    if len(paragraphs) < 2:
+        store.set_duel_status(duel["duel_id"], "cancelled")
+        send_telegram_message(GROUP_ID, "⚔️ Дуэль отменена: недостаточно участников.", message_thread_id=thread_id)
+        return
+
+    lines = [f"🗳 <b>Голосование в дуэли</b>\n\n<b>Тема:</b> {html_escape(duel['topic'])}\n<b>Участников:</b> {len(participants)}\n"]
+    for i, uid in enumerate(participants, 1):
+        username = html_escape(safe_username(uid))
+        snippet = html_escape((paragraphs.get(str(uid), "")[:240]).strip())
+        lines.append(f"\n<b>#{i} - {username}</b>\n{snippet}\n")
+
+    lines.append("\nОтветь числом (1, 2, 3...) на это сообщение. Время: 10 минут.")
+    resp = send_telegram_message(GROUP_ID, "\n".join(lines), message_thread_id=thread_id)
+    vote_msg_id = None
+    if resp and resp.get("ok"):
+        vote_msg_id = resp["result"]["message_id"]
+
+    vote_deadline = datetime.utcnow() + timedelta(minutes=10)
+    store.set_duel_voting(duel["duel_id"], vote_msg_id or 0, vote_deadline)
+
+def duel_finish_voting(duel: Dict[str, Any]) -> None:
+    participants, paragraphs, votes = duel_load_json(duel)
+    thread_id = duel.get("thread_id")
+
+    if not votes:
+        store.set_duel_status(duel["duel_id"], "finished")
+        send_telegram_message(GROUP_ID, "⚔️ Дуэль завершена: никто не проголосовал.", message_thread_id=thread_id)
+        return
+
+    counts = defaultdict(int)
+    for v in votes.values():
+        try:
+            counts[int(v)] += 1
+        except Exception:
+            pass
+
+    winner_index = max(counts.items(), key=lambda x: x[1])[0]
+    winner_id = None
     if 1 <= winner_index <= len(participants):
         winner_id = participants[winner_index - 1]
-        duel["winner"] = winner_id
-        
-        # Награждаем победителя
-        add_quotes(winner_id, duel["prize"], "Победа в дуэли")
-        if winner_id in users:
-            users[winner_id]["games_played"] = users[winner_id].get("games_played", 0) + 1
-        
+
+    store.set_duel_winner(duel["duel_id"], winner_id)
+    store.set_duel_status(duel["duel_id"], "finished")
+
+    if winner_id:
+        store.add_quotes(winner_id, int(duel["prize"]), "Победа в дуэли")
+        store.add_game_history("duel", {
+            "topic": duel["topic"],
+            "winner": winner_id,
+            "votes": votes,
+            "participants": participants
+        })
         send_telegram_message(
             GROUP_ID,
-            f"""🏆 <b>Дуэль завершена!</b>
-
-<b>Победитель:</b> {safe_username(winner_id)}
-<b>Тема:</b> {duel['topic']}
-<b>Приз:</b> {duel['prize']} кавычек 🪙
-
-Поздравляем победителя! 🎉"""
+            f"🏆 <b>Дуэль завершена!</b>\n\n<b>Победитель:</b> {html_escape(safe_username(winner_id))}\n<b>Тема:</b> {html_escape(duel['topic'])}\n<b>Приз:</b> {duel['prize']} 🪙",
+            message_thread_id=thread_id
         )
-    
-    duel["status"] = "finished"
-    games_history.append({
-        "type": "duel",
-        "topic": duel["topic"],
-        "winner": duel["winner"],
-        "date": datetime.now().isoformat()
-    })
 
 # =========================
-# ОБРАБОТКА СООБЩЕНИЙ
+# ЛИСТ ЧТЕНИЯ
 # =========================
 
-def process_message(message: dict):
-    """Обработка входящего сообщения"""
-    chat_id = message["chat"]["id"]
+def publish_reading_list(thread_id: Optional[int]) -> None:
+    items = store.pop_from_queue(5)
+    if not items:
+        send_telegram_message(GROUP_ID, "📭 <b>Лист чтения</b>\n\nОчередь пустая.", message_thread_id=thread_id)
+        return
+
+    list_date = datetime.now().strftime("%d.%m.%Y")
+    lines = [f"📚 <b>Лист чтения на {list_date}</b>\n"]
+
+    for i, a in enumerate(items, 1):
+        author = html_escape(safe_username(int(a["user_id"])))
+        url = a["url"]
+        lines.append(f"<b>{i})</b> 👤 <i>{author}</i>\n🔗 <a href=\"{url}\">Открыть</a>\n")
+        store.add_published(a, list_date)
+        store.add_quotes(int(a["user_id"]), 15, "Ссылка попала в лист чтения")
+
+    lines.append(
+        "<b>🎯 Задание:</b>\n"
+        "1) Прочитай минимум 1 ссылку\n"
+        "2) Оставь конструктивный фидбек\n"
+        "3) Получи кавычки за активность\n\n"
+        "<b>⏰ Фидбек до 23:59 МСК</b>"
+    )
+    send_telegram_message(GROUP_ID, "\n".join(lines), message_thread_id=thread_id)
+
+# =========================
+# ОБРАБОТКА UPDATES
+# =========================
+
+def process_message(message: dict) -> None:
+    chat_id = int(message["chat"]["id"])
     user_id = int(message["from"]["id"])
     text = message.get("text", "") or ""
-    
-    # Обновляем активность
-    if user_id in users:
-        users[user_id]["last_active"] = datetime.now().isoformat()
-    
-    # Проверяем, является ли это ответом на сообщение в дуэли
-    if "reply_to_message" in message and chat_id == int(GROUP_ID):
+    thread_id = message.get("message_thread_id")
+    message_id = message.get("message_id")
+
+    if store.is_registered(user_id):
+        store.set_last_active(user_id)
+
+    # reply-handling for duels in group
+    if chat_id == GROUP_ID and "reply_to_message" in message:
         reply_to = message["reply_to_message"]
-        reply_text = reply_to.get("text", "")
-        
-        # Ответ в дуэли (текст)
-        if "⚔️ Дуэль абзацев началась!" in reply_text or "🗳 Голосование в дуэли" in reply_text:
-            handle_duel_response(user_id, text, reply_text)
+        reply_mid = reply_to.get("message_id")
+        waiting = store.get_active_duel_waiting()
+        voting = store.get_active_duel_voting()
+
+        if waiting and reply_mid and int(reply_mid) == int(waiting.get("announce_message_id") or 0):
+            if store.is_registered(user_id) and text.strip():
+                duel_accept_paragraph(user_id, text)
             return
-        
-        # Голосование в дуэли (число)
-        if "Голосование:" in reply_text:
+
+        if voting and reply_mid and int(reply_mid) == int(voting.get("vote_message_id") or 0):
             try:
                 vote = int(text.strip())
-                handle_duel_vote(user_id, vote)
-            except ValueError:
-                pass
+            except Exception:
+                return
+            if store.is_registered(user_id):
+                duel_accept_vote(user_id, vote)
             return
-    
-    # Обработка команд
+
+    # commands
     if text.startswith("/"):
-        command = normalize_command(text)
-        
-        # Регистрация
-        if command == "/start":
+        cmd = normalize_command(text)
+
+        if cmd == "/start":
             user_data = {
                 "id": user_id,
                 "username": message["from"].get("username"),
                 "first_name": message["from"].get("first_name", ""),
                 "last_name": message["from"].get("last_name", "")
             }
+
+            # /start в группе: объясняем, что нужна личка
+            if chat_id != user_id:
+                link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "(BOT_USERNAME не задан)"
+                msg = (
+                    "Регистрация делается в личке с ботом.\n"
+                    "Открой чат с ботом и нажми Start.\n"
+                    f"Ссылка: {link}"
+                )
+                send_telegram_message(chat_id, msg, parse_mode=None, message_thread_id=thread_id, reply_to_message_id=message_id)
+                return
+
             register_user(user_data)
             return
-        
-        # Проверка регистрации для остальных команд
-        if not is_user_registered(user_id) and command not in ["/start", "/help"]:
-            send_telegram_message(chat_id, "⚠️ Сначала зарегистрируйся через /start")
+
+        if cmd == "/help":
+            show_help(chat_id, thread_id=thread_id if chat_id == GROUP_ID else None)
             return
-        
-        # Личные команды (работают везде)
-        if command == "/help":
-            show_help(chat_id)
+
+        # дальше нужна регистрация
+        if not store.is_registered(user_id):
+            send_telegram_message(chat_id, "Сначала зарегистрируйся через /start в личке с ботом.", message_thread_id=thread_id)
             return
-        
-        if command == "/profile":
-            show_profile(user_id, chat_id)
+
+        if cmd == "/profile":
+            show_profile(user_id, chat_id, thread_id=thread_id if chat_id == GROUP_ID else None)
             return
-        
-        if command == "/balance":
-            balance = user_balances.get(user_id, 0)
-            send_telegram_message(chat_id, f"💰 <b>Твой баланс:</b> {balance} кавычек 🪙")
+
+        if cmd == "/balance":
+            bal = store.get_balance(user_id)
+            send_telegram_message(chat_id, f"💰 <b>Твой баланс:</b> {bal} 🪙", message_thread_id=thread_id if chat_id == GROUP_ID else None)
             return
-        
-        if command == "/daily":
+
+        if cmd == "/daily":
             give_daily_reward(user_id)
             return
-        
-        if command == "/submit":
-            if chat_id == user_id:  # Только в личных сообщениях
+
+        if cmd == "/submit":
+            if chat_id == user_id:
                 start_article_submission(user_id)
             else:
-                send_telegram_message(chat_id, "✍️ Подача статьи доступна только в личных сообщениях с ботом")
+                send_telegram_message(chat_id, "Подача ссылки доступна только в личных сообщениях с ботом.", message_thread_id=thread_id)
             return
-        
-        if command == "/rules":
-            show_rules(chat_id)
-            return
-        
-        # Групповые команды (работают в группе)
-        if command == "/queue":
-            if chat_id == int(GROUP_ID) or chat_id == user_id:
-                show_queue(chat_id)
+
+        if cmd == "/my_posts":
+            if chat_id == user_id:
+                show_my_posts(user_id)
             else:
-                send_telegram_message(chat_id, "📋 Очередь можно посмотреть в группе или в личных сообщениях")
+                send_telegram_message(chat_id, "Список твоих ссылок смотри в личке: /my_posts", message_thread_id=thread_id)
             return
-        
-        if command == "/top":
-            if chat_id == int(GROUP_ID) or chat_id == user_id:
-                show_top(chat_id)
+
+        if cmd == "/rules":
+            show_rules(chat_id, thread_id=thread_id if chat_id == GROUP_ID else None)
+            return
+
+        if cmd == "/queue":
+            if chat_id == GROUP_ID or chat_id == user_id:
+                out_thread = choose_thread_id(thread_id if chat_id == GROUP_ID else None, TOPIC_QUEUE_ID if chat_id == GROUP_ID else 0)
+                show_queue(chat_id, thread_id=out_thread)
             else:
-                send_telegram_message(chat_id, "🏆 Топ можно посмотреть в группе или в личных сообщениях")
+                send_telegram_message(chat_id, "Очередь смотри в группе или в личке с ботом.", message_thread_id=thread_id)
             return
-        
-        if command == "/game":
-            if chat_id == int(GROUP_ID) or chat_id == user_id:
-                show_games_menu(chat_id)
+
+        if cmd == "/top":
+            if chat_id == GROUP_ID or chat_id == user_id:
+                show_top(chat_id, thread_id=thread_id if chat_id == GROUP_ID else None)
             else:
-                send_telegram_message(chat_id, "🎮 Игры доступны в группе")
+                send_telegram_message(chat_id, "Топ смотри в группе или в личке.", message_thread_id=thread_id)
             return
-        
-        if command == "/duel":
-            if chat_id == int(GROUP_ID):
-                start_paragraph_duel(user_id)
+
+        if cmd == "/game":
+            if chat_id == GROUP_ID or chat_id == user_id:
+                show_games_menu(chat_id, thread_id=thread_id if chat_id == GROUP_ID else None)
             else:
-                send_telegram_message(chat_id, "⚔️ Дуэли доступны только в группе")
+                send_telegram_message(chat_id, "Игры доступны в группе.", message_thread_id=thread_id)
             return
-        
-        # Админ команды
-        if command == "/publish_reading_list" and user_id in ADMIN_IDS:
-            publish_reading_list()
+
+        if cmd == "/duel":
+            if chat_id == GROUP_ID:
+                start_duel_in_group(user_id, thread_id=thread_id)
+            else:
+                send_telegram_message(chat_id, "Дуэли доступны только в группе.", message_thread_id=thread_id)
             return
-        
-        if command == "/admin_stats" and user_id in ADMIN_IDS:
-            show_admin_stats(user_id)
+
+        # admin
+        if cmd == "/publish_reading_list" and user_id in ADMIN_IDS:
+            out_thread = choose_thread_id(thread_id if chat_id == GROUP_ID else None, TOPIC_QUEUE_ID if chat_id == GROUP_ID else 0)
+            publish_reading_list(out_thread)
             return
-        
-        # Неизвестная команда
-        send_telegram_message(chat_id, "🤔 Неизвестная команда. Напиши /help для списка команд")
+
+        send_telegram_message(chat_id, "Неизвестная команда. Напиши /help.", message_thread_id=thread_id if chat_id == GROUP_ID else None)
         return
-    
-    # Обработка подачи статьи (только в личных сообщениях)
-    if chat_id == user_id and user_id in user_states:
-        state = user_states[user_id].get("state")
-        
-        if state == "awaiting_article":
-            title, description, url = parse_submission_text(text)
-            
-            if not title or not description or not url:
-                send_telegram_message(user_id, "❌ Не вижу все три блока: ЗАГОЛОВОК, ОПИСАНИЕ, ССЫЛКА\n\nПопробуй еще раз:")
+
+    # state handling (private chat)
+    if chat_id == user_id and store.is_registered(user_id):
+        state = store.get_state(user_id)
+        if state == "awaiting_link":
+            url = extract_first_url(text)
+            if not url:
+                send_telegram_message(user_id, "Не вижу ссылку. Просто отправь https://... одним сообщением.")
                 return
-            
+
             if not is_allowed_article_url(url):
                 send_telegram_message(
-                    user_id, 
-                    f"❌ Ссылка недопустима\n\nПринимаем только: {ALLOWED_PLATFORMS_TEXT}\n\nУбедись, что ссылка начинается с https:// и ведет на разрешенный сайт"
+                    user_id,
+                    f"Ссылка недопустима.\nПринимаем только: {ALLOWED_PLATFORMS_TEXT}\nПроверь, что это https:// и разрешенный сайт.",
+                    parse_mode=None
                 )
                 return
-            
-            can_submit, message = can_submit_article(user_id)
-            if not can_submit:
-                send_telegram_message(user_id, message)
-                del user_states[user_id]
+
+            ok, msg = can_submit_article(user_id)
+            if not ok:
+                send_telegram_message(user_id, msg, parse_mode=None)
+                store.clear_state(user_id)
                 return
-            
-            # Добавляем статью в очередь
-            article_id = add_article_to_queue(user_id, title, description, url)
-            
-            # Уведомление в группу
-            group_notification = f"""📝 <b>Новая статья в очереди!</b>
 
-<b>Заголовок:</b> {html_escape(title)}
-<b>Автор:</b> {safe_username(user_id)}
+            article_id = store.add_submission_and_queue(user_id, url)
+            store.add_quotes(user_id, 10, "Подача ссылки")
 
-Очередь: /queue"""
-            send_telegram_message(GROUP_ID, group_notification)
-            
-            # Подтверждение автору
+            notify_thread = choose_thread_id(None, TOPIC_QUEUE_ID)
+            send_telegram_message(
+                GROUP_ID,
+                f"📝 <b>Новая ссылка в очереди!</b>\n\n<b>Автор:</b> {html_escape(safe_username(user_id))}\n🔗 <a href=\"{url}\">Открыть</a>\n\nОчередь: /queue",
+                message_thread_id=notify_thread
+            )
+
             send_telegram_message(
                 user_id,
-                f"""✅ <b>Статья добавлена в очередь!</b>
-
-<b>Заголовок:</b> {html_escape(title)}
-<b>ID:</b> {article_id}
-<b>Позиция в очереди:</b> {len(articles_queue)}
-
-Жди публикации в листе чтения (19:00 МСК) 🕔"""
+                f"✅ <b>Ссылка добавлена в очередь!</b>\n\n<b>ID:</b> {html_escape(article_id)}\n<b>Позиция:</b> {store.queue_count()}",
             )
-            
-            del user_states[user_id]
+
+            store.clear_state(user_id)
             return
-    
-    # Если не команда и не состояние, показываем помощь
-    if chat_id == user_id:
-        send_telegram_message(user_id, "Напиши /help для списка команд или /submit чтобы подать статью ✍️")
 
-def handle_duel_response(user_id: int, text: str, reply_text: str):
-    """Обработка ответа в дуэли"""
-    # Находим активную дуэль
-    active_duel = None
-    for duel in duels:
-        if duel["status"] == "waiting":
-            active_duel = duel
-            break
-    
-    if not active_duel:
-        return
-    
-    # Проверяем, не участвовал ли уже
-    if user_id in active_duel["paragraphs"]:
-        send_telegram_message(user_id, "⚠️ Ты уже отправил текст для этой дуэли")
-        return
-    
-    # Сохраняем текст
-    active_duel["paragraphs"][user_id] = text
-    active_duel["participants"].append(user_id)
-    
-    send_telegram_message(user_id, "✅ Твой текст принят! Жди начала голосования 🤞")
-    
-    # Уведомление в группу
-    if len(active_duel["paragraphs"]) == 1:
-        send_telegram_message(GROUP_ID, f"🎯 Первый участник дуэли: {safe_username(user_id)}! Еще есть время присоединиться ⏳")
+        # not state
+        if text.strip():
+            send_telegram_message(user_id, "Напиши /help или /submit, чтобы подать ссылку.")
 
-def handle_duel_vote(user_id: int, vote: int):
-    """Обработка голоса в дуэли"""
-    # Находим дуэль в стадии голосования
-    voting_duel = None
-    for duel in duels:
-        if duel["status"] == "voting":
-            voting_duel = duel
-            break
-    
-    if not voting_duel:
-        return
-    
-    # Проверяем, не голосовал ли уже
-    if user_id in voting_duel["votes"]:
-        send_telegram_message(user_id, "⚠️ Ты уже проголосовал в этой дуэли")
-        return
-    
-    # Проверяем корректность голоса
-    participants_count = len(voting_duel["paragraphs"])
-    if 1 <= vote <= participants_count:
-        voting_duel["votes"][user_id] = vote
-        send_telegram_message(user_id, "✅ Твой голос учтен! Спасибо за участие 🤝")
-
-# =========================
-# CALLBACK ОБРАБОТЧИК
-# =========================
-
-def handle_callback(callback: dict):
-    """Обработка callback запросов"""
+def handle_callback(callback: dict) -> None:
     callback_id = callback["id"]
     user_id = int(callback["from"]["id"])
     data = callback.get("data", "")
-    
-    # Обновляем активность
-    if user_id in users:
-        users[user_id]["last_active"] = datetime.now().isoformat()
-    
+
+    cb_msg = callback.get("message", {}) or {}
+    cb_chat = int((cb_msg.get("chat", {}) or {}).get("id", 0))
+    cb_thread = cb_msg.get("message_thread_id")
+
     if data == "start_duel":
-        if is_user_registered(user_id):
-            start_paragraph_duel(user_id)
-            answer_callback(callback_id, "Дуэль началась! Смотри в группе ⚔️")
+        if not store.is_registered(user_id):
+            answer_callback(callback_id, "Сначала зарегистрируйся через /start в личке.", show_alert=True)
+            return
+        if cb_chat == GROUP_ID:
+            start_duel_in_group(user_id, thread_id=cb_thread)
+            answer_callback(callback_id, "Дуэль запущена.")
         else:
-            answer_callback(callback_id, "Сначала зарегистрируйся через /start", show_alert=True)
-    
-    elif data == "truth_game":
-        answer_callback(callback_id, "Игра 'Правда или выдумка' скоро будет доступна! 🎲")
-    
-    elif data == "wheel_game":
-        answer_callback(callback_id, "Игра 'Колесо тем' скоро будет доступна! 🎡")
-    
-    else:
-        answer_callback(callback_id, "Кнопка пока не работает. Скоро добавим функционал! 🚧")
-
-# =========================
-# АДМИН ФУНКЦИИ
-# =========================
-
-def publish_reading_list():
-    """Опубликовать лист чтения (админ)"""
-    if not articles_queue:
-        send_telegram_message(GROUP_ID, "📭 <b>Лист чтения</b>\n\nОчередь пустая. Нечего публиковать 😔")
+            answer_callback(callback_id, "Дуэль запускается в группе.")
         return
-    
-    # Берем до 5 статей из очереди
-    articles_to_publish = []
-    while len(articles_to_publish) < 5 and articles_queue:
-        article = articles_queue.popleft()
-        articles_to_publish.append(article)
-        published_articles.append(article)
-    
-    # Формируем лист чтения
-    lines = [f"📚 <b>Лист чтения на {datetime.now().strftime('%d.%m.%Y')}</b>\n"]
-    
-    for i, article in enumerate(articles_to_publish, 1):
-        author = safe_username(article["user_id"])
-        title = html_escape(article["title"])
-        description = html_escape(article["description"][:200])
-        url = article["url"]
-        
-        lines.append(f"""
-<b>{i}. {title}</b>
-👤 <i>Автор: {author}</i>
-📝 {description}...
-🔗 <a href="{url}">Читать статью</a>
-""")
-    
-    lines.append("""
-<b>🎯 Задание на сегодня:</b>
-1. Прочитай минимум 1 статью
-2. Оставь конструктивный фидбек
-3. Получи кавычки за активность
 
-<b>⏰ Фидбек принимаем до 23:59 МСК</b>""")
-    
-    text = "\n".join(lines)
-    send_telegram_message(GROUP_ID, text)
-    
-    # Награждаем авторов
-    for article in articles_to_publish:
-        user_id = article["user_id"]
-        add_quotes(user_id, 15, "Статья опубликована в листе чтения")
-        send_telegram_message(user_id, f"🎉 Твоя статья '{html_escape(article['title'][:50])}...' опубликована в листе чтения! +15 кавычек 🪙")
-    
-    return f"Опубликовано {len(articles_to_publish)} статей"
-
-def show_admin_stats(user_id: int):
-    """Показать статистику админу"""
-    stats = {
-        "users": len(users),
-        "articles_in_queue": len(articles_queue),
-        "articles_published_today": len(published_articles),
-        "total_quotes": sum(user_balances.values()),
-        "active_duels": len([d for d in duels if d["status"] in ["waiting", "voting"]]),
-        "last_hour_active": len([u for u in users.values() 
-                                 if (datetime.now() - datetime.fromisoformat(u["last_active"])).seconds < 3600])
-    }
-    
-    text = f"""📊 <b>Статистика системы</b>
-
-<b>Пользователи:</b> {stats['users']}
-<b>Активных за час:</b> {stats['last_hour_active']}
-<b>Статей в очереди:</b> {stats['articles_in_queue']}/10
-<b>Опубликовано сегодня:</b> {stats['articles_published_today']}
-<b>Всего кавычек в системе:</b> {stats['total_quotes']} 🪙
-<b>Активных дуэлей:</b> {stats['active_duels']}
-
-<b>Админ команды:</b>
-/publish_reading_list - опубликовать лист чтения"""
-    
-    send_telegram_message(user_id, text)
+    answer_callback(callback_id, "Пока не работает.")
 
 # =========================
-# WEBHOOK И МАРШРУТЫ FLASK
+# ФОН: задачи и дедлайны дуэлей
+# =========================
+
+def background_loop():
+    while True:
+        try:
+            now_utc = datetime.utcnow()
+
+            # Лист чтения: 19:00 МСК = 16:00 UTC
+            key_publish = "last_publish_date_utc"
+            today_utc = now_utc.date().isoformat()
+            if now_utc.hour == 16 and now_utc.minute == 0:
+                last = store.get_meta(key_publish)
+                if last != today_utc:
+                    if store.queue_count() > 0:
+                        publish_reading_list(choose_thread_id(None, TOPIC_QUEUE_ID))
+                    store.set_meta(key_publish, today_utc)
+
+            # Сброс published: 00:00 МСК = 21:00 UTC (условно)
+            key_reset = "last_reset_date_utc"
+            if now_utc.hour == 21 and now_utc.minute == 0:
+                last = store.get_meta(key_reset)
+                if last != today_utc:
+                    store.set_meta(key_reset, today_utc)
+
+            # Напоминания о возможности подать
+            # простой проход по всем пользователям с last_submit_at
+            users_rows = store._query_all("SELECT user_id, last_submit_at, submit_notified_at FROM user_state WHERE last_submit_at IS NOT NULL")
+            now_local = datetime.now()
+            for r in users_rows:
+                uid = int(r["user_id"])
+                try:
+                    last_submit = datetime.fromisoformat(r["last_submit_at"])
+                except Exception:
+                    continue
+                hours = (now_local - last_submit).total_seconds() / 3600
+                if hours >= 48 and not store.queue_has_user(uid):
+                    last_notified = None
+                    if r["submit_notified_at"]:
+                        try:
+                            last_notified = datetime.fromisoformat(r["submit_notified_at"])
+                        except Exception:
+                            last_notified = None
+                    if (not last_notified) or ((now_local - last_notified).total_seconds() > 3600):
+                        resp = send_telegram_message(uid, "🔔 Можно подать новую ссылку. Используй /submit")
+                        if resp and resp.get("ok"):
+                            store.set_submit_notified_at(uid, now_local)
+
+            # Дуэли: закрыть прием/голосование по дедлайнам
+            waiting_due, voting_due = store.list_duels_due(now_utc)
+
+            for d in waiting_due:
+                duel_finish_submissions(d)
+
+            for d in voting_due:
+                duel_finish_voting(d)
+
+        except Exception as e:
+            logger.error(f"background_loop error: {e}", exc_info=True)
+
+        time.sleep(20)
+
+threading.Thread(target=background_loop, daemon=True).start()
+
+# =========================
+# FLASK ROUTES
 # =========================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Обработка вебхука от Telegram"""
     try:
         data = request.get_json(force=True, silent=True) or {}
-        
-        # Логируем тип обновления
-        update_keys = list(data.keys())
-        logger.info(f"📨 Получен вебхук: {update_keys}")
-        
-        # Обработка сообщения
+        logger.info(f"webhook keys: {list(data.keys())}")
+
         if "message" in data:
             process_message(data["message"])
-        
-        # Обработка callback запросов
         elif "callback_query" in data:
             handle_callback(data["callback_query"])
-        
+
         return jsonify({"status": "ok"}), 200
-    
     except Exception as e:
-        logger.error(f"❌ Ошибка в webhook: {e}", exc_info=True)
+        logger.error(f"webhook error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check для Render"""
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "users": len(users),
-        "queue": len(articles_queue),
-        "version": "2.0"
+        "db_path": DB_PATH,
+        "users": store._query_one("SELECT COUNT(*) AS c FROM users")["c"],
+        "queue": store.queue_count(),
+        "version": "3.0-sqlite"
     }), 200
 
 @app.route("/", methods=["GET"])
 def home():
-    """Главная страница"""
-    return """
-    <h1>🤖 Бот для клуба "Увлекательные чтения"</h1>
-    <p>Статус: <strong>Работает ✅</strong></p>
-    <p>Пользователей: {}</p>
-    <p>Статей в очереди: {}</p>
-    <p><a href="/health">Проверка здоровья</a></p>
-    """.format(len(users), len(articles_queue))
-
-# =========================
-# АВТОМАТИЧЕСКИЕ ЗАДАЧИ
-# =========================
-
-def schedule_daily_tasks():
-    """Планировщик ежедневных задач"""
-    def task_loop():
-        while True:
-            now = datetime.now()
-            
-            # Публикация листа чтения в 19:00 МСК (16:00 UTC)
-            if now.hour == 16 and now.minute == 0:
-                if articles_queue:
-                    publish_reading_list()
-            
-            # Ежедневный сброс счетчиков в 00:00 МСК (21:00 UTC предыдущего дня)
-            if now.hour == 21 and now.minute == 0:
-                published_articles.clear()
-                logger.info("📅 Ежедневный сброс: очищен список опубликованных статей")
-            
-            time.sleep(60)  # Проверка каждую минуту
-    
-    thread = threading.Thread(target=task_loop, daemon=True)
-    thread.start()
-
-def schedule_submit_reminders():
-    """Напоминания о возможности подать статью"""
-    def reminder_loop():
-        while True:
-            now = datetime.now()
-            
-            for user_id, last_submit in list(user_last_submit.items()):
-                if not isinstance(last_submit, datetime):
-                    continue
-                
-                # Проверяем, прошло ли 48 часов
-                hours_passed = (now - last_submit).total_seconds() / 3600
-                if hours_passed >= 48:
-                    # Проверяем, не уведомляли ли уже
-                    last_notified = user_submit_notified.get(user_id)
-                    if not last_notified or (now - last_notified).total_seconds() > 3600:
-                        if user_id in users:
-                            send_telegram_message(
-                                user_id,
-                                "🔔 <b>Можно подать новую статью!</b>\n\nПрошло более 48 часов с последней подачи. Используй /submit ✍️"
-                            )
-                            user_submit_notified[user_id] = now
-            
-            time.sleep(300)  # Проверка каждые 5 минут
-    
-    thread = threading.Thread(target=reminder_loop, daemon=True)
-    thread.start()
-
-# =========================
-# ИНИЦИАЛИЗАЦИЯ
-# =========================
-
-def init():
-    """Инициализация приложения"""
-    logger.info("🚀 Инициализация бота...")
-    
-    # Запуск фоновых задач
-    schedule_daily_tasks()
-    schedule_submit_reminders()
-    
-    logger.info(f"✅ Бот инициализирован. Пользователей: {len(users)}, Очередь: {len(articles_queue)}")
-
-# Запуск инициализации при импорте
-init()
-
-# =========================
-# ЗАПУСК СЕРВЕРА
-# =========================
+    return (
+        "<h1>ClubBot</h1>"
+        "<p>Status: OK</p>"
+        f"<p>Users: {store._query_one('SELECT COUNT(*) AS c FROM users')['c']}</p>"
+        f"<p>Queue: {store.queue_count()}</p>"
+        "<p><a href='/health'>Health</a></p>"
+    )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
