@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 import threading
 import time
 import re
+import atexit
 
 # ============ НАСТРОЙКА ============
 
@@ -57,6 +58,8 @@ games_history = []  # История игр
 duels = []  # Активные дуэли
 games_results = []  # Результаты игр для закрепа
 games_pin_message_id = None  # ID закрепленного сообщения в теме игр
+DATA_FILE = os.environ.get('BOT_DATA_FILE', 'data.json')
+DATA_LOCK = threading.Lock()
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 
@@ -93,6 +96,68 @@ def send_telegram_message(
     except Exception as e:
         logger.error(f"Ошибка отправки сообщения: {e}")
         return None
+
+def save_data():
+    """Сохранение данных в JSON файл"""
+    with DATA_LOCK:
+        payload = {
+            'users': users,
+            'articles_queue': list(articles_queue),
+            'published_articles': published_articles,
+            'user_articles': dict(user_articles),
+            'user_balances': dict(user_balances),
+            'user_last_submit': {
+                str(k): v.isoformat() for k, v in user_last_submit.items()
+            },
+            'user_daily_reward': user_daily_reward,
+            'games_history': games_history,
+            'duels': duels,
+            'games_results': games_results,
+            'games_pin_message_id': games_pin_message_id
+        }
+        try:
+            with open(DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения данных: {e}")
+
+def load_data():
+    """Загрузка данных из JSON файла"""
+    global users, articles_queue, published_articles, user_articles
+    global user_balances, user_last_submit, user_daily_reward
+    global games_history, duels, games_results, games_pin_message_id
+
+    if not os.path.exists(DATA_FILE):
+        return
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        users = data.get('users', {})
+        articles_queue = deque(data.get('articles_queue', []), maxlen=10)
+        published_articles = data.get('published_articles', [])
+        user_articles = defaultdict(list, data.get('user_articles', {}))
+        user_balances = defaultdict(int, data.get('user_balances', {}))
+        user_last_submit = {
+            int(k): datetime.fromisoformat(v)
+            for k, v in data.get('user_last_submit', {}).items()
+        }
+        user_daily_reward = data.get('user_daily_reward', {})
+        games_history = data.get('games_history', [])
+        duels = data.get('duels', [])
+        games_results = data.get('games_results', [])
+        games_pin_message_id = data.get('games_pin_message_id')
+        logger.info("✅ Данные загружены из файла")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки данных: {e}")
+
+def schedule_data_saves(interval_seconds=60):
+    """Периодическое сохранение данных"""
+    def save_loop():
+        while True:
+            time.sleep(interval_seconds)
+            save_data()
+    thread = threading.Thread(target=save_loop, daemon=True)
+    thread.start()
 
 def delete_telegram_message(chat_id, message_id):
     """Удаление сообщения в Telegram"""
@@ -1975,6 +2040,9 @@ def set_webhook():
         return f"❌ Ошибка подключения: {str(e)}"
 
 if __name__ == '__main__':
+    load_data()
+    schedule_data_saves()
+    atexit.register(save_data)
     # Запускаем планировщик задач
     schedule_daily_tasks()
     
