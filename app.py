@@ -58,8 +58,11 @@ games_history = []  # История игр
 duels = []  # Активные дуэли
 games_results = []  # Результаты игр для закрепа
 games_pin_message_id = None  # ID закрепленного сообщения в теме игр
+codex/find-error-in-telegram-bot-code-2crs1s
 DATA_FILE = os.environ.get('BOT_DATA_FILE', 'data.json')
 DATA_LOCK = threading.Lock()
+=======
+main
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 
@@ -97,6 +100,7 @@ def send_telegram_message(
         logger.error(f"Ошибка отправки сообщения: {e}")
         return None
 
+codex/find-error-in-telegram-bot-code-2crs1s
 def save_data():
     """Сохранение данных в JSON файл"""
     with DATA_LOCK:
@@ -159,6 +163,8 @@ def schedule_data_saves(interval_seconds=60):
     thread = threading.Thread(target=save_loop, daemon=True)
     thread.start()
 
+
+main
 def delete_telegram_message(chat_id, message_id):
     """Удаление сообщения в Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteMessage"
@@ -175,6 +181,7 @@ def schedule_message_deletion(chat_id, message_id, delay_seconds):
     """Планирование удаления сообщения"""
     threading.Timer(delay_seconds, delete_telegram_message, args=[chat_id, message_id]).start()
 
+    codex/find-error-in-telegram-bot-code-2crs1s
 def send_temporary_message(
     chat_id,
     text,
@@ -183,13 +190,20 @@ def send_temporary_message(
     topic_id=None,
     reply_markup=None
 ):
+
+def send_temporary_message(chat_id, text, delete_after_seconds, reply_to_message_id=None, topic_id=None):
+main
     """Отправка временного сообщения, удаляемого через заданное время"""
     result = send_telegram_message(
         chat_id,
         text,
         reply_to_message_id=reply_to_message_id,
+      codex/find-error-in-telegram-bot-code-2crs1s
         topic_id=topic_id,
         reply_markup=reply_markup
+
+        topic_id=topic_id
+main
     )
     if result and 'result' in result:
         schedule_message_deletion(chat_id, result['result']['message_id'], delete_after_seconds)
@@ -480,6 +494,7 @@ def update_games_pin():
         }
         requests.post(pin_url, json=pin_payload, timeout=10)
 
+codex/find-error-in-telegram-bot-code-2crs1s
 def build_main_menu_keyboard():
     """Создать inline-клавиатуру основного меню"""
     return {
@@ -514,7 +529,7 @@ def show_main_menu(chat_id):
         menu_text,
         reply_markup=build_main_menu_keyboard()
     )
-
+main
 # ============ ИГРЫ И АКТИВНОСТИ ============
 
 def start_paragraph_duel(initiator_id, topic=None):
